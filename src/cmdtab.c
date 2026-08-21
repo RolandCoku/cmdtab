@@ -43,6 +43,9 @@
 #include <commoncontrols.h>
 #include <mmsystem.h> // PlaySound
 #include <shellscalingapi.h> // GetDpiForMonitor
+#include <appmodel.h> // GetApplicationUserModelId
+#include <shlobj.h> // SHCreateItemInKnownFolder
+#include <knownfolders.h> // FOLDERID_AppsFolder
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "shlwapi.lib") // Only used by StringFileName for PathFindFileNameW?
@@ -118,6 +121,30 @@ static string StringFileName(string *filepath, bool extension)
 	}
 	name.ok = name.ok && SUCCEEDED(StringCchLengthW(name.text, countof(name.text), &name.length));
 	return name;
+}
+
+static string StringWithoutBrackets(string *s)
+{
+	// Strip square-bracketed groups from a string, ex. a window title carrying
+	// posh-git style status junk: "repo [main ↑0 | ↓0]" becomes "repo".
+	// Collapses the whitespace left behind and trims the ends. Can come out
+	// empty (ok == false) when the whole string was bracketed
+	string result = {0};
+	iz length = 0;
+	int depth = 0;
+	for (iz i = 0; i < s->length; i++) {
+		u16 c = s->text[i];
+		if (c == L'[') { depth++; continue; }
+		if (c == L']') { if (depth > 0) depth--; continue; }
+		if (depth > 0) continue;
+		if (c == L' ' && (length == 0 || result.text[length-1] == L' ')) continue;
+		result.text[length++] = c;
+	}
+	while (length > 0 && result.text[length-1] == L' ') length--;
+	result.text[length] = 0;
+	result.length = length;
+	result.ok = (length > 0);
+	return result;
 }
 
 static i64 StartMeasuring(void)
@@ -386,6 +413,13 @@ static string GetAppName(string *filepath)
 		return name;
 }
 
+static bool ExeHasIcon(string *filepath)
+{
+	// Does this .exe embed any icon resources of its own?
+	// Passing -1 as the index makes ExtractIconExW just count icon groups
+	return ExtractIconExW(filepath->text, -1, null, null, 0) > 0;
+}
+
 static handle GetAppIcon(string *filepath)
 {
 	//IsImmersiveProcess();
@@ -427,6 +461,198 @@ static handle GetAppIcon(string *filepath)
 	IImageList_GetIcon(list, info.iIcon, ILD_TRANSPARENT, &icon);
 	IImageList_Release(list);
 	return icon; // Caller is responsible for calling DestroyIcon
+}
+
+// Packaged apps (MSIX, ie. anything from the Microsoft Store) keep their real
+// display name and icon in their package manifest, *not* in their .exe. Both
+// GetAppName and GetAppIcon above therefore come up empty-handed for them:
+//
+//   WhatsApp.Root.exe has version info FileDescription "WhatsApp.Root" (an
+//   auto-generated .NET assembly name) and zero icon resources, so the shell
+//   hands out the generic "unknown application" icon for it
+//
+// Note that this is *not* the same thing as the UWP app host wrangling done by
+// GetCoreWindow/GetAppHost above. Those handle true UWP apps, which live inside
+// ApplicationFrameHost.exe. A packaged *desktop* app like WhatsApp owns its
+// process and a plain top-level window, so it sails past all of that and gets
+// treated as an ordinary .exe.
+//
+// The fix is to ask the shell instead, via the app's Application User Model ID
+// and the AppsFolder namespace, which is where the Start menu and taskbar get
+// their names and icons from.
+
+static u32 PackagedIconSize = 256; // Matches the 256x256 icons of SHIL_JUMBO used by GetAppIcon
+
+static string GetAppUserModelId(handle hwnd)
+{
+	// Get the Application User Model ID of a window's app, which is the key
+	// used to look the app up in the shell's AppsFolder
+	// Fails (ok == false) for regular unpackaged apps, which is the common case
+	string aumid = {0};
+	ULONG pid;
+	GetWindowThreadProcessId(hwnd, &pid);
+	handle process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+	if (!process || process == INVALID_HANDLE_VALUE) {
+		return aumid;
+	}
+	u32 length = countof(aumid.text);
+	// Returns APPMODEL_ERROR_NO_APPLICATION for unpackaged apps. Not worth
+	// logging, since most apps are unpackaged
+	aumid.ok = (GetApplicationUserModelId(process, &length, aumid.text) == ERROR_SUCCESS);
+	CloseHandle(process);
+	if (aumid.ok) {
+		aumid.length = length - 1; // 'length' counts the null terminator, our lengths don't
+	}
+	return aumid;
+}
+
+static IShellItem2 *GetAppsFolderItem(string *aumid)
+{
+	// Look a packaged app up in the shell's AppsFolder namespace
+	// Caller is responsible for calling IShellItem2_Release
+	IShellItem2 *item = null;
+	if (FAILED(SHCreateItemInKnownFolder(&FOLDERID_AppsFolder, 0, aumid->text, &IID_IShellItem2, (void **)&item))) {
+		return null;
+	}
+	return item;
+}
+
+static string GetShellItemName(IShellItem2 *item)
+{
+	// Get the packaged app's manifest display name, ex. "WhatsApp"
+	string name = {0};
+	u16 *display = null;
+	if (SUCCEEDED(IShellItem2_GetDisplayName(item, SIGDN_NORMALDISPLAY, &display)) && display) {
+		name.ok = SUCCEEDED(StringCchCopyW(name.text, countof(name.text), display));
+		name.ok = name.ok && SUCCEEDED(StringCchLengthW(name.text, countof(name.text), &name.length));
+		CoTaskMemFree(display);
+	}
+	return name;
+}
+
+static handle BitmapToIcon(HBITMAP bitmap)
+{
+	// The shell hands out images as bitmaps, but the switcher draws icons
+	// (DrawIconEx), so convert
+	BITMAP bm = {0};
+	if (!GetObject(bitmap, sizeof bm, &bm)) {
+		return null;
+	}
+	// CreateIconIndirect wants a mask bitmap even for the 32-bpp bitmaps we get
+	// here, which carry their own alpha channel and leave the mask unused. An
+	// all-zero mask means "fully opaque". CreateBitmap leaves the bits
+	// *undefined* when passed null, so hand it explicitly zeroed bits
+	iz stride = ((bm.bmWidth + 15) / 16) * 2; // CreateBitmap pads scanlines to a WORD boundary
+	void *bits = calloc(1, stride * bm.bmHeight);
+	if (!bits) {
+		return null;
+	}
+	HBITMAP mask = CreateBitmap(bm.bmWidth, bm.bmHeight, 1, 1, bits);
+	free(bits);
+	if (!mask) {
+		return null;
+	}
+	ICONINFO iconInfo = {.fIcon = true, .hbmColor = bitmap, .hbmMask = mask};
+	HICON icon = CreateIconIndirect(&iconInfo); // Copies both bitmaps, so we still own ours
+	DeleteObject(mask);
+	return icon; // Caller is responsible for calling DestroyIcon
+}
+
+static handle GetShellItemIcon(IShellItem2 *item, u32 size)
+{
+	// Get the packaged app's manifest logo, ex. WhatsApp's Assets\AppList.png
+	handle icon = null;
+	IShellItemImageFactory *images = null;
+	if (SUCCEEDED(IShellItem2_QueryInterface(item, &IID_IShellItemImageFactory, (void **)&images))) {
+		HBITMAP bitmap = null;
+		SIZE imageSize = {size, size}; // Can't inline this compound literal: its comma would split the COBJMACROS macro's args
+		// SIIGBF_ICONONLY gets us the app's logo instead of a document preview,
+		// and keeps this synchronous (no thumbnail extraction, so no E_PENDING)
+		if (SUCCEEDED(IShellItemImageFactory_GetImage(images, imageSize, SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK, &bitmap)) && bitmap) {
+			icon = BitmapToIcon(bitmap);
+			DeleteObject(bitmap);
+		}
+		IShellItemImageFactory_Release(images);
+	}
+	return icon;
+}
+
+// The AppsFolder lookups above cost ~30ms per app, and UpdateApps rebuilds the
+// whole app list on every single Alt-Tab, so memoize them. Without this, having
+// a handful of Store apps open takes UpdateApps from 15ms to 130ms+, which is
+// long enough to feel like lag before the switcher appears.
+//
+// A packaged app's manifest name and logo can't change while it's running, so
+// entries never need invalidating. (A Store update that changes an app's logo
+// won't be picked up until cmdtab restarts. Fine tradeoff for the hot path.)
+// Failed lookups are cached too, so we don't retry them on every Alt-Tab.
+
+static struct packagedApp {
+	string aumid;               // Application User Model ID, the cache key
+	string name;                // Manifest display name. Can be !ok if lookup failed
+	handle icon;                // Manifest logo, owned by this cache. Can be null if lookup failed or wasn't needed
+	bool iconLookedUp;          // The icon is only looked up on demand, see GetPackagedAppIcon
+} PackagedApps[128];            // Sized to match the 'Apps' array declared below
+static iz PackagedAppsCount;    // Number of elements in 'PackagedApps' array
+
+static struct packagedApp *GetPackagedApp(string *aumid)
+{
+	for (iz i = 0; i < PackagedAppsCount; i++) {
+		if (StringsAreEqual(&PackagedApps[i].aumid, aumid)) {
+			return &PackagedApps[i];
+		}
+	}
+	if (PackagedAppsCount >= countof(PackagedApps)) {
+		return null; // Cache full, callers fall back to the .exe's resources
+	}
+	// Not seen before, so pay for the name lookup, once
+	struct packagedApp *cached = &PackagedApps[PackagedAppsCount++];
+	cached->aumid = *aumid;
+	cached->name = (string){0};
+	cached->icon = null;
+	cached->iconLookedUp = false;
+	IShellItem2 *item = GetAppsFolderItem(aumid);
+	if (item) {
+		cached->name = GetShellItemName(item);
+		IShellItem2_Release(item);
+	}
+	if (!cached->name.ok) {
+		Log(L"WARNING couldn't get AppsFolder name for %s\n", aumid->text);
+	}
+	return cached;
+}
+
+static string GetPackagedAppName(string *aumid)
+{
+	struct packagedApp *cached = GetPackagedApp(aumid);
+	return cached ? cached->name : (string){0};
+}
+
+static handle GetPackagedAppIcon(string *aumid)
+{
+	struct packagedApp *cached = GetPackagedApp(aumid);
+	if (!cached) {
+		return null;
+	}
+	// Only a minority of packaged apps need this (those whose .exe embeds no
+	// icon), so don't look the logo up until someone actually asks for it
+	if (!cached->iconLookedUp) {
+		cached->iconLookedUp = true;
+		IShellItem2 *item = GetAppsFolderItem(aumid);
+		if (item) {
+			cached->icon = GetShellItemIcon(item, PackagedIconSize);
+			IShellItem2_Release(item);
+		}
+		if (!cached->icon) {
+			Log(L"WARNING couldn't get AppsFolder icon for %s\n", aumid->text);
+		}
+	}
+	if (!cached->icon) {
+		return null;
+	}
+	// Hand out a copy, so callers keep the same ownership contract as with
+	// GetAppIcon (ie. they DestroyIcon it) while the cache keeps its own
+	return CopyIcon(cached->icon); // Caller is responsible for calling DestroyIcon
 }
 
 static bool IsDarkModeEnabled(void)
@@ -617,6 +843,12 @@ struct ini { // cmdtab settings
 	u32 iconSize;
 	u32 iconHorzPadding;
 	u32 fontSize;
+	u32 previewWidth;       // Width of a window preview cell in the window bar
+	u32 previewHeight;      // Height of the thumbnail area of a preview cell
+	u32 previewLabelHeight; // Height of the title label under each thumbnail
+	u32 previewLabelGap;    // Vertical gap between a thumbnail and its title label
+	u32 previewPadding;     // Padding between and around preview cells
+	u32 barGap;             // Vertical gap between the window bar and the main switcher
 	// Blacklist
 	struct identifier {
 		u16 *filename;          // Filename without file extension, ex. "explorer". Can be null
@@ -650,14 +882,31 @@ static handle      DrawingBitmap;   // Off-screen bitmap used for double-buffere
 static RECT        DrawingRect;     // Size of the off-screen bitmap
 static f32         DrawingScale;    // DPI scale of the monitor where the cursor is, which is where the switcher will be displayed
 static i32         MouseX, MouseY;  // Mouse position, for highlighting and clicking app icons in switcher
+// GUI, window bar (the secondary switcher that floats above the main one, with
+// live previews of the selected app's windows)
+static handle      WindowBar;        // Handle for window bar
+static handle      WindowBarContext; // Drawing context for double-buffered drawing of window bar
+static handle      WindowBarBitmap;  // Off-screen bitmap used for double-buffered drawing of window bar
+static RECT        WindowBarRect;    // Size of the window bar off-screen bitmap
+static HTHUMBNAIL  Thumbnails[64];   // DWM live thumbnails, parallel to SelectedApp->windows. Sized to match 'windows' in struct app
+static iz          ThumbnailsCount;  // Number of elements in 'Thumbnails' array
+
+enum mode {
+	MODE_IDLE,    // Switcher inactive (SelectedWindow == null)
+	MODE_APPS,    // Cycling apps in the main app bar (Alt-Tab)
+	MODE_WINDOWS, // Cycling windows of the selected app (Alt-Backquote)
+};
+static enum mode   Mode;             // Which level of the switcher the user is navigating
 
 //================
 // Initialization
 //================
 
 static LRESULT CALLBACK SwitcherWindowProcedure(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
+static LRESULT CALLBACK WindowBarProcedure(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam);
 static VOID    CALLBACK EventHookProcedure(HWINEVENTHOOK hook, ULONG event, HWND hwnd, LONG objectid, LONG childid, ULONG threadid, ULONG timestamp);
 static LRESULT CALLBACK KeyboardHookProcedure(INT code, WPARAM wparam, LPARAM lparam);
+static void             UpdateApps(void);
 
 static void InitConfig(void)
 {
@@ -680,6 +929,12 @@ static void InitConfig(void)
 		.iconSize                =  64,
 		.iconHorzPadding         =   8,
 		.fontSize                =  16,
+		.previewWidth            = 200,
+		.previewHeight           = 120,
+		.previewLabelHeight      =  22,
+		.previewLabelGap         =   8,
+		.previewPadding          =  12,
+		.barGap                  =  12,
 		// Blacklist
 		.blacklist = {
 			{ null,                       L"ApplicationFrameWindow" },
@@ -762,6 +1017,22 @@ static void InitSwitcherWindow(handle instance)
 	DwmSetWindowAttribute(Switcher, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof corners);
 }
 
+static void InitWindowBarWindow(handle instance)
+{
+	// Create window bar, a detached floating sibling of the switcher window with
+	// the exact same styling (see InitSwitcherWindow for comments on the styles)
+	WNDCLASSEXW wcex = {0};
+	wcex.cbSize = sizeof wcex;
+	wcex.lpfnWndProc = WindowBarProcedure;
+	wcex.hInstance = instance;
+	wcex.hCursor = LoadCursorW(null, IDC_ARROW);
+	wcex.lpszClassName = L"cmdtabWindowBar";
+	WindowBar = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, MAKEINTATOM(RegisterClassExW(&wcex)), null, 0, 0, 0, 0, 0, null, null, instance, null);
+	SetWindowLongW(WindowBar, GWL_STYLE, 0);
+	DWM_WINDOW_CORNER_PREFERENCE corners = DWMWCP_ROUND;
+	DwmSetWindowAttribute(WindowBar, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof corners);
+}
+
 static int RunCmdTab(handle instance, u16 *args)
 {
 	if (HasDebugLaunchArgument(args)) {
@@ -784,11 +1055,19 @@ static int RunCmdTab(handle instance, u16 *args)
 	i32 _ = CoInitialize(null);
 
 	InitSwitcherWindow(instance);
+	InitWindowBarWindow(instance);
 	InitWindowActivationTracking();
 	InitKeyboardHook();
 
+	// Build the app list once up front. Nothing needs it yet, but it warms the
+	// caches the shell lookups in UpdateApps depend on (see PackagedApps), so
+	// the user's first Alt-Tab isn't the one that pays for them
+	UpdateApps();
+
 	// Run message loop
-	for (MSG msg; GetMessageW(&msg, Switcher, 0, 0) > 0;) DispatchMessageW(&msg); // Not handling -1 errors. Whatever
+	// Unfiltered, so both the switcher and the window bar get their messages.
+	// Quit is signalled by PostQuitMessage in the switcher's WM_DESTROY
+	for (MSG msg; GetMessageW(&msg, null, 0, 0) > 0;) DispatchMessageW(&msg); // Not handling -1 errors. Whatever
 
 	// Uninstall keyboard & event hooks
 	UnhookWindowsHookEx(KeyboardHook);
@@ -983,14 +1262,41 @@ static void AddToApps(handle hwnd)
 			Error(Switcher, L"ERROR reached max. apps\n");
 			return;
 		}
-		string title = Config.groupByApp ? GetAppName(&filepath) : GetWindowTitle(hwnd); // TODO Fall back to app name for empty window titles
+		// Packaged (Microsoft Store) apps keep their real name and icon in their
+		// package manifest rather than in their .exe, so prefer asking the shell
+		// for those, and fall back to the .exe's resources for unpackaged apps
+		// (and for the odd packaged app the shell has nothing on)
+		string aumid = GetAppUserModelId(hwnd);
+		string title = {0};
+		if (!Config.groupByApp) {
+			title = GetWindowTitle(hwnd); // TODO Fall back to app name for empty window titles
+		} else {
+			if (aumid.ok) {
+				title = GetPackagedAppName(&aumid);
+			}
+			if (!title.ok) {
+				title = GetAppName(&filepath);
+			}
+		}
+		// For the icon, prefer the .exe's own when it has one: an embedded icon
+		// group carries several sizes up to 256x256, whereas a package's app
+		// list logo is often only 88x88 (ex. Claude), which looks blurry blown
+		// up to our icon size. A packaged app whose .exe embeds no icon at all
+		// (ex. WhatsApp) is exactly the case the manifest logo is needed for
+		handle icon = null;
+		if (aumid.ok && !ExeHasIcon(&filepath)) {
+			icon = GetPackagedAppIcon(&aumid);
+		}
+		if (!icon) {
+			icon = GetAppIcon(&filepath);
+		}
 		// This app is not previously added, so create new app entry for it
 		// Since I reset by truncating (setting AppsCount to 0), make sure to overwrite all struct fields when reusing array slots
 		app = &Apps[AppsCount++];
 		if (app->icon) DestroyIcon(app->icon); // In fact, I have to do a little lazy cleanup
 		app->path = filepath;
 		app->name = title;
-		app->icon = GetAppIcon(&filepath);
+		app->icon = icon;
 		app->windowsCount = 0; // Same truncation trick here (but hwnds are not structs, so no fields to overwrite)
 	}
 	if (app->windowsCount >= countof(app->windows)) {
@@ -1250,6 +1556,9 @@ static void RedrawSwitcher(void)
 	static HBRUSH selectionBackground = {0};
 	static HBRUSH selectionColor = {0};
 	static HPEN selectionOutline = {0};
+	static HBRUSH badgeBackground = {0};
+	static HFONT badgeFont = {0};
+	static f32 badgeFontScale = 0;
 
 	// Init background brushes (static vars)
 	if (windowBackground == null) {
@@ -1263,6 +1572,14 @@ static void RedrawSwitcher(void)
 	}
 	if (selectionOutline == null) {
 		selectionOutline = CreatePen(PS_SOLID, SEL_OUTLINE, GetAccentColor() & 0x00FFFFFF); // SEL_COLOR
+	}
+	if (badgeBackground == null) {
+		badgeBackground = CreateSolidBrush(SEL_COLOR_BG);
+	}
+	if (badgeFont == null || badgeFontScale != DrawingScale) {
+		if (badgeFont) DeleteObject(badgeFont);
+		badgeFont = CreateFontW(-(i32)(DrawingScale * 12), 0, 0, 0, FW_SEMIBOLD, false, false, false, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+		badgeFontScale = DrawingScale;
 	}
 
 	// Window rect
@@ -1353,6 +1670,24 @@ static void RedrawSwitcher(void)
 			///* dbg */ FillRect(DrawingContext, &titleRect, CreateSolidBrush(RGB(255, 0, 0))); // Check the size of the text box
 			DrawTextW(DrawingContext, titleText, -1, &titleRect, DT_SINGLELINE | DT_CENTER | DT_BOTTOM);
 		}
+
+		// Window count badge on the top right of the icon, for apps with
+		// multiple windows (only meaningful when grouping by app)
+		if (Config.groupByApp && app->windowsCount > 1) {
+			u16 count[8];
+			swprintf(count, countof(count), L"%lld", (i64)app->windowsCount);
+			i32 badgeSize  = DrawingScale * 22;
+			i32 badgeBleed = DrawingScale *  6; // How far the badge pokes out past the icon's corner
+			RECT badgeRect = {right + badgeBleed - badgeSize, top - badgeBleed, right + badgeBleed, top - badgeBleed + badgeSize};
+			HPEN oldBadgePen = (HPEN)SelectObject(DrawingContext, GetStockObject(NULL_PEN));
+			HBRUSH oldBadgeBrush = (HBRUSH)SelectObject(DrawingContext, badgeBackground);
+			Ellipse(DrawingContext, badgeRect.left, badgeRect.top, badgeRect.right, badgeRect.bottom);
+			HFONT oldBadgeFont = (HFONT)SelectObject(DrawingContext, badgeFont);
+			DrawTextW(DrawingContext, count, -1, &badgeRect, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+			SelectObject(DrawingContext, oldBadgeFont);
+			SelectObject(DrawingContext, oldBadgeBrush);
+			SelectObject(DrawingContext, oldBadgePen);
+		}
 	}
 }
 
@@ -1397,6 +1732,236 @@ static struct app *GetAppForPosition(i32 x, i32 y)
 	return null;
 }
 
+//============
+// Window bar
+//============
+// The window bar is the secondary switcher: a detached floating bar directly
+// above the main app bar, holding live DWM thumbnails of the selected app's
+// windows. It appears when the user presses the window hotkey (Alt-Backquote)
+// while the app bar is visible, and both bars hide together when switching
+// completes. The previews are composited by the DWM straight into the bar
+// (DwmRegisterThumbnail), so showing them costs nothing per frame; cmdtab only
+// draws the background, the selection highlight and the title labels.
+
+struct barcell {
+	RECT thumb; // Thumbnail area of the cell. The DWM composites the live preview into an aspect-fit subrect of this
+	RECT label; // Title label strip under the thumbnail
+};
+
+static struct barcell GetWindowBarCell(iz index)
+{
+	// Cell layout in window bar client coordinates
+	u32 cellWidth   = DrawingScale * Config.previewWidth;
+	u32 thumbHeight = DrawingScale * Config.previewHeight;
+	u32 labelHeight = DrawingScale * Config.previewLabelHeight;
+	u32 labelGap    = DrawingScale * Config.previewLabelGap;
+	u32 padding     = DrawingScale * Config.previewPadding;
+	i32 left = padding + index * (cellWidth + padding);
+	i32 top  = padding;
+	struct barcell cell;
+	cell.thumb = (RECT){left, top, left + (i32)cellWidth, top + (i32)thumbHeight};
+	cell.label = (RECT){left, top + (i32)(thumbHeight + labelGap), left + (i32)cellWidth, top + (i32)(thumbHeight + labelGap + labelHeight)};
+	return cell;
+}
+
+static void UnregisterThumbnails(void)
+{
+	for (iz i = 0; i < ThumbnailsCount; i++) {
+		if (Thumbnails[i]) {
+			DwmUnregisterThumbnail(Thumbnails[i]);
+			Thumbnails[i] = null;
+		}
+	}
+	ThumbnailsCount = 0;
+}
+
+static void RegisterThumbnails(void)
+{
+	UnregisterThumbnails();
+	if (!SelectedApp) {
+		return;
+	}
+	for (iz i = 0; i < SelectedApp->windowsCount && i < countof(Thumbnails); i++) {
+		// Thumbnail sources must be top-level windows, so ask for the app host in case of UWP core windows
+		if (FAILED(DwmRegisterThumbnail(WindowBar, GetAppHost(SelectedApp->windows[i]), &Thumbnails[i]))) {
+			Log(L"WARNING couldn't register thumbnail for ");
+			LogWindow(SelectedApp->windows[i]);
+			Thumbnails[i] = null;
+		}
+		ThumbnailsCount++;
+	}
+}
+
+static void LayoutThumbnails(void)
+{
+	for (iz i = 0; i < ThumbnailsCount; i++) {
+		if (!Thumbnails[i]) {
+			continue;
+		}
+		struct barcell cell = GetWindowBarCell(i);
+		// Aspect-fit the source window into the cell's thumbnail area, centered
+		SIZE source = {0};
+		RECT dest = cell.thumb;
+		if (SUCCEEDED(DwmQueryThumbnailSourceSize(Thumbnails[i], &source)) && source.cx > 0 && source.cy > 0) {
+			i32 destWidth  = cell.thumb.right - cell.thumb.left;
+			i32 destHeight = cell.thumb.bottom - cell.thumb.top;
+			f32 scaleX = (f32)destWidth / source.cx;
+			f32 scaleY = (f32)destHeight / source.cy;
+			f32 fit = scaleX < scaleY ? scaleX : scaleY;
+			i32 fitWidth  = source.cx * fit;
+			i32 fitHeight = source.cy * fit;
+			dest.left   = cell.thumb.left + (destWidth - fitWidth) / 2;
+			dest.top    = cell.thumb.top + (destHeight - fitHeight) / 2;
+			dest.right  = dest.left + fitWidth;
+			dest.bottom = dest.top + fitHeight;
+		}
+		DWM_THUMBNAIL_PROPERTIES properties = {
+			.dwFlags = DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE,
+			.rcDestination = dest,
+			.fVisible = true,
+		};
+		DwmUpdateThumbnailProperties(Thumbnails[i], &properties);
+	}
+}
+
+static void ResizeWindowBar(void)
+{
+	// Sized from the selected app's window count and positioned to float
+	// directly above the main switcher, horizontally centered on it. The
+	// switcher is always resized first (ResizeSwitcher), so DrawingScale and
+	// DrawingRect are current here
+	iz windowsCount = SelectedApp ? SelectedApp->windowsCount : 0;
+
+	u32 cellWidth  = DrawingScale * Config.previewWidth;
+	u32 cellHeight = DrawingScale * (Config.previewHeight + Config.previewLabelGap + Config.previewLabelHeight);
+	u32 padding    = DrawingScale * Config.previewPadding;
+	u32 gap        = DrawingScale * Config.barGap;
+
+	u32 w = windowsCount * (cellWidth + padding) + padding; // TODO Overflows the monitor for very many windows
+	u32 h = cellHeight + 2 * padding;
+	i32 x = (DrawingRect.left + DrawingRect.right - (i32)w) / 2;
+	i32 y = DrawingRect.top - (i32)(gap + h);
+
+	MoveWindow(WindowBar, x, y, w, h, false);
+
+	// Resize off-screen double-buffering bitmap (same dance as ResizeSwitcher)
+	RECT resized = {x, y, x+w, y+h};
+	if (!EqualRect(&WindowBarRect, &resized)) {
+		handle context = GetDC(WindowBar);
+		DeleteObject(WindowBarBitmap);
+		DeleteDC(WindowBarContext);
+		WindowBarRect = resized;
+		WindowBarContext = CreateCompatibleDC(context);
+		WindowBarBitmap = CreateCompatibleBitmap(context, WindowBarRect.right - WindowBarRect.left, WindowBarRect.bottom - WindowBarRect.top);
+		handle oldBitmap = (handle)SelectObject(WindowBarContext, WindowBarBitmap);
+		DeleteObject(oldBitmap);
+		ReleaseDC(WindowBar, context);
+	}
+}
+
+static void RedrawWindowBar(void)
+{
+	// Same palette as RedrawSwitcher
+	COLORREF WIN_COLOR_BG = RGB(32, 32, 32);
+	COLORREF TXT_COLOR    = RGB(235, 235, 235);
+	COLORREF SEL_COLOR_BG = RGB(11, 11, 11);
+
+	u32 SEL_OUTLINE = DrawingScale * 3.5;
+	u32 SEL_RADIUS  = DrawingScale * 10;
+	u32 SEL_OFF     = DrawingScale *  6; // Selection rectangle inflation around the thumbnail area
+
+	static HBRUSH windowBackground = {0};
+	static HBRUSH selectionBackground = {0};
+	static HPEN selectionOutline = {0};
+	static HFONT labelFont = {0};
+	static f32 labelFontScale = 0;
+
+	if (windowBackground == null) {
+		windowBackground = CreateSolidBrush(WIN_COLOR_BG);
+	}
+	if (selectionBackground == null) {
+		selectionBackground = CreateSolidBrush(SEL_COLOR_BG);
+	}
+	if (selectionOutline == null) {
+		selectionOutline = CreatePen(PS_SOLID, SEL_OUTLINE, GetAccentColor() & 0x00FFFFFF);
+	}
+	if (labelFont == null || labelFontScale != DrawingScale) {
+		if (labelFont) DeleteObject(labelFont);
+		labelFont = CreateFontW(-(i32)(DrawingScale * 13), 0, 0, 0, FW_NORMAL, false, false, false, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+		labelFontScale = DrawingScale;
+	}
+
+	RECT windowRect = {0};
+	GetClientRect(WindowBar, &windowRect);
+
+	// Invalidate & draw window background
+	RedrawWindow(WindowBar, null, null, RDW_INVALIDATE | RDW_ERASE);
+	FillRect(WindowBarContext, &windowRect, windowBackground);
+
+	if (!SelectedApp) {
+		return;
+	}
+
+	SelectObject(WindowBarContext, selectionOutline);
+	SelectObject(WindowBarContext, selectionBackground);
+	SelectObject(WindowBarContext, labelFont);
+	SetTextColor(WindowBarContext, TXT_COLOR);
+	SetBkMode(WindowBarContext, TRANSPARENT);
+
+	iz selectedIndex = SelectedWindow ? SelectedWindow - SelectedApp->windows : -1;
+
+	for (iz i = 0; i < ThumbnailsCount; i++) {
+		struct barcell cell = GetWindowBarCell(i);
+		// Selection rectangle around the thumbnail area. The live preview is
+		// composited over the cell by the DWM, not drawn here
+		if (i == selectedIndex) {
+			RoundRect(WindowBarContext, cell.thumb.left - (i32)SEL_OFF, cell.thumb.top - (i32)SEL_OFF, cell.thumb.right + (i32)SEL_OFF, cell.thumb.bottom + (i32)SEL_OFF, SEL_RADIUS, SEL_RADIUS);
+		}
+		// Window title label under the thumbnail, ellipsized to the cell width,
+		// with bracketed status junk stripped (ex. a terminal's posh-git
+		// "[main ↑0 | ↓0]"), falling back to the app name for windows whose
+		// title is empty (or was nothing but brackets)
+		string title = GetWindowTitle(SelectedApp->windows[i]);
+		title = StringWithoutBrackets(&title);
+		if (!title.ok) {
+			title = SelectedApp->name;
+		}
+		DrawTextW(WindowBarContext, title.text, title.length, &cell.label, DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+	}
+}
+
+static void ShowWindowBar(void)
+{
+	ResizeWindowBar();
+	RegisterThumbnails();
+	LayoutThumbnails();
+	RedrawWindowBar();
+	ShowWindow(WindowBar, SW_SHOWNA); // No activation, the main switcher keeps the foreground
+}
+
+static void HideWindowBar(void)
+{
+	UnregisterThumbnails();
+	HideWindow(WindowBar);
+}
+
+static LRESULT CALLBACK WindowBarProcedure(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
+{
+	switch (message) {
+		case WM_PAINT: {
+			// Double buffered drawing, just blit the WindowBarContext (see OnSwitcherPaint)
+			PAINTSTRUCT ps;
+			if (BeginPaint(WindowBar, &ps)) {
+				BitBlt(ps.hdc, 0, 0, WindowBarRect.right - WindowBarRect.left, WindowBarRect.bottom - WindowBarRect.top, WindowBarContext, 0, 0, SRCCOPY);
+				EndPaint(WindowBar, &ps);
+			}
+			return 1;
+		}
+		default:
+			return DefWindowProcW(hwnd, message, wparam, lparam);
+	}
+}
+
 static void ShowSwitcher(void)
 {
 	///*dbg*/i64 start = StartMeasuring();
@@ -1429,11 +1994,13 @@ static void ShowSelectedWindow(void)
 static void HideSwitcher(void)
 {
 	Log(L"cancel/close\n");
+	HideWindowBar();
 	HideWindow(Switcher);
 	LockSetForegroundWindow(LSFW_UNLOCK);
 	// Reset selection
 	SelectedApp = null;
 	SelectedWindow = null;
+	Mode = MODE_IDLE;
 }
 
 //static void CloseWindows(handle hwnd) // Alternative to TerminateWindowProcess
@@ -1514,6 +2081,7 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 				Log(L"no apps\n");
 				goto passMessage;
 			}
+			Mode = MODE_APPS;
 			SelectFirstApp(); // Initialize selection
 			if (*SelectedWindow == GetCoreWindow(GetForegroundWindow())) { // Don't select next when on blank desktop
 				SelectNextApp(shiftHeld, !keyRepeat || !Config.wrapbump);
@@ -1540,6 +2108,7 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 				Log(L"no apps\n");
 				goto passMessage;
 			}
+			Mode = MODE_WINDOWS;
 			SelectFirstApp(); // Initialize selection
 			SelectNextWindow(shiftHeld, !keyRepeat || !Config.wrapbump);
 			if (Config.fastSwitchingForWindows) {
@@ -1548,6 +2117,7 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 			if (Config.showSwitcherForWindows) {
 				ResizeSwitcher(); // Since we have called UpdateApp() above
 				ShowSwitcher();
+				ShowWindowBar();
 			}
 			goto consumeMessage;
 		}
@@ -1583,10 +2153,51 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 			bool key2Down = keyCode == Config.hotkeyForWindows.key && keyDown;
 			bool prevDown = (keyCode == VK_UP || keyCode == VK_LEFT) && keyDown;
 			bool nextDown = (keyCode == VK_DOWN || keyCode == VK_RIGHT) && keyDown;
+			bool windowBarVisible = IsWindowVisible(WindowBar);
+
+			// Alt-Backquote while cycling apps descends into window switching for
+			// the selected app: the window bar with live previews appears above
+			// the app bar (State 2 -> State 3). Without grouping by app there is
+			// nothing to descend into, so fall through to plain window cycling
+			if (key2Down && Mode == MODE_APPS && Config.groupByApp) {
+				if (SelectedApp && SelectedApp->windowsCount > 1) {
+					Mode = MODE_WINDOWS;
+					if (IsWindowVisible(Switcher)) {
+						ShowWindowBar();
+					} else if (Config.fastSwitchingForWindows) {
+						SelectNextWindow(shiftHeld, !keyRepeat || !Config.wrapbump);
+						ShowSelectedWindow();
+					}
+				}
+				goto consumeMessage;
+			}
+
+			// Window navigation - subsequent Alt-Tilde/Backquote, and also arrow
+			// keys while the window bar is up (hold Shift for previous). Tab is
+			// not included: it always returns to app cycling, see below
+			if (key2Down || (windowBarVisible && (nextDown || prevDown))) {
+				SelectNextWindow(shiftHeld || prevDown, !keyRepeat || !Config.wrapbump);
+				if (windowBarVisible) {
+					RedrawWindowBar(); // Thumbnails are unchanged, only the selection highlight moves
+				} else if (Config.fastSwitchingForWindows) {
+					ShowSelectedWindow();
+				}
+				if (!windowBarVisible && Config.showSwitcherForWindows) {
+					ShowSwitcher();
+					ShowWindowBar();
+				}
+				goto consumeMessage;
+			}
 
 			// Subsequent Alt-Tab - next app (hold Shift for previous)
 			// Also arrow keys, left and right
+			// Tab while the window bar is up backs out of window switching and
+			// resumes app cycling (State 3 -> State 2)
 			if (key1Down || (nextDown || prevDown)) {
+				if (windowBarVisible) {
+					HideWindowBar();
+				}
+				Mode = MODE_APPS;
 				SelectNextApp(shiftHeld || prevDown, !keyRepeat || !Config.wrapbump);
 				if (Config.fastSwitchingForApps) {
 					ShowSelectedWindow();
@@ -1597,17 +2208,28 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 				goto consumeMessage;
 			}
 
-			// Subsequent Alt-Tilde/Backquote - next window (hold Shift for previous)
-			// TODO Also arrow keys, up and down
-			if (key2Down) {
-				SelectNextWindow(shiftHeld, !keyRepeat || !Config.wrapbump);
-				if (Config.fastSwitchingForWindows) {
-					ShowSelectedWindow();
+			// Alt-1 .. Alt-9 - directly activate the item at that position:
+			// an app in the app bar, or a window of the selected app when the
+			// window bar is up. Top row and numpad both work
+			bool digitDown = keyDown && ((keyCode >= '1' && keyCode <= '9') || (keyCode >= VK_NUMPAD1 && keyCode <= VK_NUMPAD9));
+
+			if (digitDown) {
+				iz index = keyCode >= VK_NUMPAD1 ? keyCode - VK_NUMPAD1 : keyCode - '1';
+				if (windowBarVisible) {
+					if (index < SelectedApp->windowsCount) {
+						SelectedWindow = &SelectedApp->windows[index];
+						ShowSelectedWindow();
+						HideSwitcher();
+					}
+				} else {
+					if (index < AppsCount) {
+						SelectedApp = &Apps[index];
+						SelectedWindow = &SelectedApp->windows[0];
+						ShowSelectedWindow();
+						HideSwitcher();
+					}
 				}
-				if (Config.showSwitcherForWindows) {
-					ShowSwitcher();
-				}
-				goto consumeMessage;
+				goto consumeMessage; // Out-of-range numbers are consumed and ignored, like the input sink below
 			}
 
 			// ========================================
@@ -1624,8 +2246,16 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 				goto consumeMessage;
 			}
 			// Alt-Esc - cancel switching and restore initial window
+			// When the window bar is up, the first Esc only backs out of window
+			// switching, up to the app bar (State 3 -> State 2)
 			if (escDown) { // BUG There's a bug here if mod1Held and mod2Held aren't both the same key. In that case I'll still pass through the key event, even though I should own it since it's not Alt-Esc
-				HideSwitcher();
+				if (IsWindowVisible(WindowBar)) {
+					HideWindowBar();
+					Mode = MODE_APPS;
+					SelectedWindow = &SelectedApp->windows[0];
+				} else {
+					HideSwitcher();
+				}
 				goto consumeMessage;
 			}
 
@@ -1649,6 +2279,10 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 			}
 			// Alt-Q - close all windows of selected application
 			if (keyQDown) {
+				if (IsWindowVisible(WindowBar)) { // UpdateApps invalidates the thumbnails, so back out of window switching
+					HideWindowBar();
+					Mode = MODE_APPS;
+				}
 				//CloseWindows(*SelectedWindow);
 				TerminateWindowProcess(*SelectedWindow);
 				UpdateApps();
@@ -1662,6 +2296,10 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 			}
 			// Alt-W or Alt-Delete - close selected window
 			if (keyWDown || deleteDown) {
+				if (IsWindowVisible(WindowBar)) { // UpdateApps invalidates the thumbnails, so back out of window switching
+					HideWindowBar();
+					Mode = MODE_APPS;
+				}
 				CloseWindowX(*SelectedWindow);
 				UpdateApps();
 				// TODO fix selection
@@ -1688,6 +2326,10 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 			}
 			if (keyGDown) {
 				// TODO Refactor
+				if (IsWindowVisible(WindowBar)) { // Regrouping invalidates the thumbnails, so back out of window switching
+					HideWindowBar();
+					Mode = MODE_APPS;
+				}
 				handle selectedWindow = *SelectedWindow;
 				Config.groupByApp = !Config.groupByApp;
 				SetRegKey(L"groupByApp", Config.groupByApp);
@@ -1828,6 +2470,10 @@ static i64 OnSwitcherMouseMove(i32 x, i32 y)
 	struct app *mouseoverApp = GetAppForPosition(MouseX, MouseY);
 
 	if (SelectedApp != mouseoverApp && mouseoverApp) {
+		if (IsWindowVisible(WindowBar)) { // Previews belong to the previously selected app, so back out of window switching
+			HideWindowBar();
+			Mode = MODE_APPS;
+		}
 		SelectedApp = mouseoverApp;
 		SelectedWindow = &SelectedApp->windows[0];
 		/*dbg*/Log(L"select app ");
@@ -1892,6 +2538,12 @@ static LRESULT CALLBACK SwitcherWindowProcedure(HWND hwnd, UINT message, WPARAM 
 			return OnSwitcherMouseUp();
 		case WM_CLOSE:
 			return OnSwitcherClose();
+		case WM_DESTROY:
+			// The message loop is unfiltered (see RunCmdTab), so it no longer
+			// exits on the -1 GetMessageW returns for a destroyed filter window,
+			// and needs an explicit quit
+			PostQuitMessage(0);
+			return 0;
 		default:
 			return DefWindowProcW(hwnd, message, wparam, lparam);
 	}

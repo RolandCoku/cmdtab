@@ -18,7 +18,7 @@ cmdtab.exe: src/cmdtab.c res/cmdtab.o
 	$(CC) $(CFLAGS) $(LDFLAGS) $(INCLUDE) -o $@ $^ $(LDLIBS)
 
 %.o: %.rc
-	windres -I res/ -o $@ $^
+	$(WINDRES) -I res/ -o $@ $^
 
 clean:
 	rm cmdtab.exe res/cmdtab.o || true

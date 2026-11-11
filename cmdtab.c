@@ -47,6 +47,7 @@
 #include <shlobj.h> // SHCreateItemInKnownFolder
 #include <knownfolders.h> // FOLDERID_AppsFolder
 
+#ifdef _MSC_VER
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "shlwapi.lib") // Only used by StringFileName for PathFindFileNameW?
 #pragma comment(lib, "dwmapi.lib")
@@ -54,41 +55,53 @@
 #pragma comment(lib, "version.lib")
 #pragma comment(lib, "winmm.lib") // PlaySound
 #pragma comment(lib, "shcore.lib") // GetDpiForMonitor
-
 #pragma comment(linker, "/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='amd64' publicKeyToken='6595b64144ccf1df' language='*'\"")
+#endif
 
 //==============================================================================
 // Utility belt
 //==============================================================================
 
 #define countof(a) (ptrdiff_t)(sizeof(a)/sizeof(*a))
-#define string(str) {str,countof(str)-1,true}
+#define string(str) {str,countof(str)-1}
 
 #define false 0
 #define true 1
-#define null NULL // WHY IS EVERYONE SCREAMING
 
+typedef unsigned char        u8;
 typedef wchar_t             u16; // "Microsoft implements wchar_t as a two-byte unsigned value."
 typedef unsigned int        u32;
 typedef unsigned long long  u64;
+typedef signed short        i16;
 typedef signed int          i32;
 typedef signed long long    i64;
 typedef float               f32;
 typedef signed int         bool;
+typedef size_t               uz;
 typedef ptrdiff_t            iz;
 typedef void *           handle;
 typedef struct string    string;
 
 struct string {
 	u16 text[MAX_PATH];
-	iz length;
-	bool ok;
+	i16 length; // < 0 indicates error
 };
 
 static string UWPAppHostExe      = string(L"ApplicationFrameHost.exe");
 static string UWPAppHostClass    = string(L"ApplicationFrameWindow");
 static string UWPCoreWindowClass = string(L"Windows.UI.Core.CoreWindow");
 static string UWPAppsPath        = string(L"C:\\Program Files\\WindowsApps");
+
+static i16 StringLength(u16 *s1, i16 max)
+{
+	// Wrangle HRESULT and size_t -> i16 (i16 max = 0x7FFF, u16 max = 0xFFFF)
+	uz length;
+	if (SUCCEEDED(StringCchLengthW(s1, max, &length))) {
+		return length;
+	} else {
+		return -1;
+	}
+}
 
 static bool StringsAreEqual(string *s1, string *s2)
 {
@@ -115,11 +128,15 @@ static string StringFileName(string *filepath, bool extension)
 {
 	// aka. basename
 	string name = {0};
-	name.ok = SUCCEEDED(StringCchCopyNW(name.text, countof(name.text), PathFindFileNameW(filepath->text), countof(name.text)));
+	u16 *filename = PathFindFileNameW(filepath->text);
+	bool ok = SUCCEEDED(StringCchCopyNW(name.text, countof(name.text)-1, filename, filepath->length - (filename - filepath->text)));
 	if (!extension) {
-		name.ok = name.ok && SUCCEEDED(PathCchRemoveExtension(name.text, countof(name.text)));
+		ok = ok && SUCCEEDED(PathCchRemoveExtension(name.text, countof(name.text)));
 	}
-	name.ok = name.ok && SUCCEEDED(StringCchLengthW(name.text, countof(name.text), &name.length));
+	name.length = StringLength(name.text, countof(name.text));
+	if (name.length <= 0 || !ok) {
+		name.length = -1;
+	}
 	return name;
 }
 
@@ -128,7 +145,7 @@ static string StringWithoutBrackets(string *s)
 	// Strip square-bracketed groups from a string, ex. a window title carrying
 	// posh-git style status junk: "repo [main ↑0 | ↓0]" becomes "repo".
 	// Collapses the whitespace left behind and trims the ends. Can come out
-	// empty (ok == false) when the whole string was bracketed
+	// empty (length -1) when the whole string was bracketed
 	string result = {0};
 	iz length = 0;
 	int depth = 0;
@@ -142,8 +159,7 @@ static string StringWithoutBrackets(string *s)
 	}
 	while (length > 0 && result.text[length-1] == L' ') length--;
 	result.text[length] = 0;
-	result.length = length;
-	result.ok = (length > 0);
+	result.length = length > 0 ? length : -1;
 	return result;
 }
 
@@ -164,45 +180,45 @@ static i64 FinishMeasuring(i64 start)
 
 static void Print(u16 *fmt, ...)
 {
-	u16 buffer[2048];
+	u16 buffer[2048], *end;
 	va_list args;
 	va_start(args, fmt);
-	StringCchVPrintfW(buffer, countof(buffer)-1, fmt, args);
+	StringCchVPrintfExW(buffer, countof(buffer)-1, &end, NULL, 0, fmt, args);
 	va_end(args);
 	#ifdef _MSC_VER
 	  OutputDebugStringW(buffer);
 	#else
-	  fputws(buffer, stdout);
+	  WriteConsoleW(GetStdHandle(STD_OUTPUT_HANDLE), buffer, end - buffer, NULL, NULL);
 	#endif
 }
 
 static void Log(u16 *fmt, ...)
 {
-	#ifndef _DEBUG
-	u16 buffer[2048];
+	#ifdef _DEBUG
+	u16 buffer[2048], *end;
 	va_list args;
 	va_start(args, fmt);
-	StringCchVPrintfW(buffer, countof(buffer)-1, fmt, args);
+	StringCchVPrintfExW(buffer, countof(buffer)-1, &end, NULL, 0, fmt, args);
 	va_end(args);
 	#ifdef _MSC_VER
 	  OutputDebugStringW(buffer);
 	#else
-	  fputws(buffer, stdout);
+	  WriteConsoleW(GetStdHandle(STD_OUTPUT_HANDLE), buffer, end - buffer, NULL, NULL);
 	#endif
 	#endif
 }
 
 static void Error(handle hwnd, u16 *fmt, ...)
 {
-	u16 buffer[2048];
+	u16 buffer[2048], *end;
 	va_list args;
 	va_start(args, fmt);
-	StringCchVPrintfW(buffer, countof(buffer)-1, fmt, args);
+	StringCchVPrintfExW(buffer, countof(buffer)-1, &end, NULL, 0, fmt, args);
 	va_end(args);
 	#ifdef _MSC_VER
 	  OutputDebugStringW(buffer);
 	#else
-	  fputws(buffer, stdout);
+	  WriteConsoleW(GetStdHandle(STD_OUTPUT_HANDLE), buffer, end - buffer, NULL, NULL);
 	#endif
 	SetForegroundWindow(GetLastActivePopup(hwnd));
 	MessageBoxW(hwnd, buffer, L"cmdtab", MB_OK | MB_ICONERROR | MB_TASKMODAL);
@@ -222,8 +238,10 @@ static bool Ask(handle hwnd, u16 *fmt, ...)
 static string GetWindowClass(handle hwnd)
 {
 	string class = {0};
-	class.length = GetClassNameW(hwnd, class.text, countof(class.text));
-	class.ok = (class.length > 0);
+	class.length = (i16)GetClassNameW(hwnd, class.text, countof(class.text));
+	if (class.length <= 0) {
+		class.length = -1;
+	}
 	return class;
 }
 
@@ -287,18 +305,21 @@ static string GetExePath(handle hwnd)
 	string path = {0};
 	ULONG pid;
 	GetWindowThreadProcessId(hwnd, &pid);
-	handle process = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid);
+	handle process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
 	if (!process || process == INVALID_HANDLE_VALUE) {
 		Log(L"WARNING couldn't open process with pid: %u\n", pid);
 		return path;
 	}
 	ULONG length = countof(path.text);
-	path.ok = QueryFullProcessImageNameW(process, 0, path.text, &length);
+	BOOL ok = QueryFullProcessImageNameW(process, 0, path.text, &length);
 	CloseHandle(process);
-	if (path.ok) {
+	if (ok) {
 		path.length = length;
 	} else {
 		Log(L"WARNING couldn't get exe path for process with pid: %u\n", pid);
+	}
+	if (path.length <= 0) {
+		path.length = -1;
 	}
 	return path;
 }
@@ -307,7 +328,9 @@ static string GetWindowTitle(handle hwnd)
 {
 	string title = {0};
 	title.length = GetWindowTextW(hwnd, title.text, countof(title.text));
-	title.ok = (title.length > 0);
+	if (title.length <= 0) {
+		title.length = -1;
+	}
 	return title;
 }
 
@@ -316,7 +339,7 @@ static void LogWindow(handle hwnd)
 	if (hwnd) {
 		#ifdef _DEBUG
 		string filepath = GetExePath(hwnd);
-		if (!filepath.ok) return;
+		if (filepath.length <= 0) return;
 		string filename = StringFileName(&filepath, false);
 		string class = GetWindowClass(hwnd);
 		string title = GetWindowTitle(hwnd);
@@ -345,13 +368,13 @@ static void LogWindow(handle hwnd)
 		Log(L"%p\n", hwnd);
 		#endif
 	} else {
-		Log(L"null hwnd\n");
+		Log(L"NULL hwnd\n");
 	}
 }
 
 static string GetAppName(string *filepath)
 {
-	// Query version info for pretty application name. See cmdtab's own res/cmdtab.rc file for an idea of the data that is queried
+	// Query version info for pretty application name. See cmdtab's own cmdtab.rc file for an idea of the data that is queried
 
 	string name = {0};
 
@@ -360,10 +383,10 @@ static string GetAppName(string *filepath)
 		u32 size;
 	} versionInfo;
 
-	if (!(versionInfo.size = GetFileVersionInfoSizeW(filepath->text, null))) {
+	if (!(versionInfo.size = GetFileVersionInfoSizeW(filepath->text, NULL))) {
 		goto abort;
 	}
-	if (!(versionInfo.data = malloc(versionInfo.size))) {
+	if (!(versionInfo.data = HeapAlloc(GetProcessHeap(), 0, versionInfo.size))) {
 		goto abort;
 	}
 	if (!GetFileVersionInfoW(filepath->text, 0, versionInfo.size, versionInfo.data)) {
@@ -375,7 +398,7 @@ static string GetAppName(string *filepath)
 		u16 codepage;
 	} *translation;
 
-	if (!VerQueryValueW(versionInfo.data, L"\\VarFileInfo\\Translation", (void *)&translation, null)) {
+	if (!VerQueryValueW(versionInfo.data, L"\\VarFileInfo\\Translation", (void *)&translation, NULL)) {
 		goto free;
 	}
 
@@ -389,14 +412,14 @@ static string GetAppName(string *filepath)
 	// Prefer the pretty application name in the "FileDescription" field
 	StringCchPrintfW(key, countof(key), L"\\StringFileInfo\\%04x%04x\\FileDescription", translation[0].language, translation[0].codepage);
 
-	if (VerQueryValueW(versionInfo.data, key, (void *)&value.text, &value.length) && wcslen(value.text) > 0) {
+	if (VerQueryValueW(versionInfo.data, key, (void *)&value.text, &value.length) && StringLength(value.text, value.length) > 0) {
 		goto success;
 	}
 
 	// Fall back to "ProductName" if "FileDescription" is empty. Example: Github Desktop
 	StringCchPrintfW(key, countof(key), L"\\StringFileInfo\\%04x%04x\\ProductName", translation[0].language, translation[0].codepage);
 
-	if (VerQueryValueW(versionInfo.data, key, (void *)&value.text, &value.length) && wcslen(value.text) > 0) {
+	if (VerQueryValueW(versionInfo.data, key, (void *)&value.text, &value.length) && StringLength(value.text, value.length) > 0) {
 		goto success;
 	}
 
@@ -405,10 +428,13 @@ static string GetAppName(string *filepath)
 	goto free;
 
 	success:
-		name.length = value.length < countof(name.text) ? value.length : countof(name.text);
-		name.ok = SUCCEEDED(StringCchCopyNW(name.text, countof(name.text)-1, value.text, countof(name.text)-1));
+		if (SUCCEEDED(StringCchCopyNW(name.text, countof(name.text)-1, value.text, value.length))) {
+			name.length = value.length < countof(name.text) ? value.length : countof(name.text);
+		} else {
+			name.length = -1;
+		}
 	free:
-		free(versionInfo.data);
+		HeapFree(GetProcessHeap(), 0, versionInfo.data);
 	abort:
 		return name;
 }
@@ -417,7 +443,7 @@ static bool ExeHasIcon(string *filepath)
 {
 	// Does this .exe embed any icon resources of its own?
 	// Passing -1 as the index makes ExtractIconExW just count icon groups
-	return ExtractIconExW(filepath->text, -1, null, null, 0) > 0;
+	return ExtractIconExW(filepath->text, -1, NULL, NULL, 0) > 0;
 }
 
 static handle GetAppIcon(string *filepath)
@@ -444,18 +470,21 @@ static handle GetAppIcon(string *filepath)
 	// NOTE: Can also check out SHDefExtractIcon
 	//       https://devblogs.microsoft.com/oldnewthing/20140501-00/?p=1103
 
-	//if (FAILED(CoInitialize(null))) {
-	//	return null;
+	//if (FAILED(CoInitialize(NULL))) {
+	//	return NULL;
 	//}
 	IImageList *list = {0};
 	if (FAILED(SHGetImageList(SHIL_JUMBO, &IID_IImageList, (void **)&list))) {
-		return null;
+		return NULL;
 	}
 	SHFILEINFOW info = {0};
 	if (!SHGetFileInfoW(filepath->text, 0, &info, sizeof info, SHGFI_SYSICONINDEX)) { // 2nd arg: -1, 0 or FILE_ATTRIBUTE_NORMAL
 		Print(L"suspicious SHGetFileInfoW return"); // SHGetFileInfoW has special return with SHGFI_SYSICONINDEX flag, which I think should never fail (docs unclear?)
+		#ifdef _DEBUG
 		__debugbreak();
-		return null;
+		#endif
+		IImageList_Release(list);
+		return NULL;
 	}
 	HICON icon = {0};
 	IImageList_GetIcon(list, info.iIcon, ILD_TRANSPARENT, &icon);
@@ -498,11 +527,9 @@ static string GetAppUserModelId(handle hwnd)
 	u32 length = countof(aumid.text);
 	// Returns APPMODEL_ERROR_NO_APPLICATION for unpackaged apps. Not worth
 	// logging, since most apps are unpackaged
-	aumid.ok = (GetApplicationUserModelId(process, &length, aumid.text) == ERROR_SUCCESS);
+	bool ok = (GetApplicationUserModelId(process, &length, aumid.text) == ERROR_SUCCESS);
 	CloseHandle(process);
-	if (aumid.ok) {
-		aumid.length = length - 1; // 'length' counts the null terminator, our lengths don't
-	}
+	aumid.length = ok && length > 1 ? (i16)(length - 1) : -1; // 'length' counts the null terminator, our lengths don't
 	return aumid;
 }
 
@@ -510,9 +537,9 @@ static IShellItem2 *GetAppsFolderItem(string *aumid)
 {
 	// Look a packaged app up in the shell's AppsFolder namespace
 	// Caller is responsible for calling IShellItem2_Release
-	IShellItem2 *item = null;
+	IShellItem2 *item = NULL;
 	if (FAILED(SHCreateItemInKnownFolder(&FOLDERID_AppsFolder, 0, aumid->text, &IID_IShellItem2, (void **)&item))) {
-		return null;
+		return NULL;
 	}
 	return item;
 }
@@ -521,10 +548,10 @@ static string GetShellItemName(IShellItem2 *item)
 {
 	// Get the packaged app's manifest display name, ex. "WhatsApp"
 	string name = {0};
-	u16 *display = null;
+	u16 *display = NULL;
 	if (SUCCEEDED(IShellItem2_GetDisplayName(item, SIGDN_NORMALDISPLAY, &display)) && display) {
-		name.ok = SUCCEEDED(StringCchCopyW(name.text, countof(name.text), display));
-		name.ok = name.ok && SUCCEEDED(StringCchLengthW(name.text, countof(name.text), &name.length));
+		bool ok = SUCCEEDED(StringCchCopyW(name.text, countof(name.text), display));
+		name.length = ok ? StringLength(name.text, countof(name.text)) : -1;
 		CoTaskMemFree(display);
 	}
 	return name;
@@ -536,7 +563,7 @@ static handle BitmapToIcon(HBITMAP bitmap)
 	// (DrawIconEx), so convert
 	BITMAP bm = {0};
 	if (!GetObject(bitmap, sizeof bm, &bm)) {
-		return null;
+		return NULL;
 	}
 	// CreateIconIndirect wants a mask bitmap even for the 32-bpp bitmaps we get
 	// here, which carry their own alpha channel and leave the mask unused. An
@@ -545,12 +572,12 @@ static handle BitmapToIcon(HBITMAP bitmap)
 	iz stride = ((bm.bmWidth + 15) / 16) * 2; // CreateBitmap pads scanlines to a WORD boundary
 	void *bits = calloc(1, stride * bm.bmHeight);
 	if (!bits) {
-		return null;
+		return NULL;
 	}
 	HBITMAP mask = CreateBitmap(bm.bmWidth, bm.bmHeight, 1, 1, bits);
 	free(bits);
 	if (!mask) {
-		return null;
+		return NULL;
 	}
 	ICONINFO iconInfo = {.fIcon = true, .hbmColor = bitmap, .hbmMask = mask};
 	HICON icon = CreateIconIndirect(&iconInfo); // Copies both bitmaps, so we still own ours
@@ -561,10 +588,10 @@ static handle BitmapToIcon(HBITMAP bitmap)
 static handle GetShellItemIcon(IShellItem2 *item, u32 size)
 {
 	// Get the packaged app's manifest logo, ex. WhatsApp's Assets\AppList.png
-	handle icon = null;
-	IShellItemImageFactory *images = null;
+	handle icon = NULL;
+	IShellItemImageFactory *images = NULL;
 	if (SUCCEEDED(IShellItem2_QueryInterface(item, &IID_IShellItemImageFactory, (void **)&images))) {
-		HBITMAP bitmap = null;
+		HBITMAP bitmap = NULL;
 		SIZE imageSize = {size, size}; // Can't inline this compound literal: its comma would split the COBJMACROS macro's args
 		// SIIGBF_ICONONLY gets us the app's logo instead of a document preview,
 		// and keeps this synchronous (no thumbnail extraction, so no E_PENDING)
@@ -603,20 +630,20 @@ static struct packagedApp *GetPackagedApp(string *aumid)
 		}
 	}
 	if (PackagedAppsCount >= countof(PackagedApps)) {
-		return null; // Cache full, callers fall back to the .exe's resources
+		return NULL; // Cache full, callers fall back to the .exe's resources
 	}
 	// Not seen before, so pay for the name lookup, once
 	struct packagedApp *cached = &PackagedApps[PackagedAppsCount++];
 	cached->aumid = *aumid;
 	cached->name = (string){0};
-	cached->icon = null;
+	cached->icon = NULL;
 	cached->iconLookedUp = false;
 	IShellItem2 *item = GetAppsFolderItem(aumid);
 	if (item) {
 		cached->name = GetShellItemName(item);
 		IShellItem2_Release(item);
 	}
-	if (!cached->name.ok) {
+	if (cached->name.length <= 0) {
 		Log(L"WARNING couldn't get AppsFolder name for %s\n", aumid->text);
 	}
 	return cached;
@@ -632,7 +659,7 @@ static handle GetPackagedAppIcon(string *aumid)
 {
 	struct packagedApp *cached = GetPackagedApp(aumid);
 	if (!cached) {
-		return null;
+		return NULL;
 	}
 	// Only a minority of packaged apps need this (those whose .exe embeds no
 	// icon), so don't look the logo up until someone actually asks for it
@@ -648,7 +675,7 @@ static handle GetPackagedAppIcon(string *aumid)
 		}
 	}
 	if (!cached->icon) {
-		return null;
+		return NULL;
 	}
 	// Hand out a copy, so callers keep the same ownership contract as with
 	// GetAppIcon (ie. they DestroyIcon it) while the cache keeps its own
@@ -659,7 +686,7 @@ static bool IsDarkModeEnabled(void)
 {
 	ULONG value;
 	ULONG size = sizeof value;
-	if (!RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", L"AppsUseLightTheme", RRF_RT_DWORD, null, &value, &size)) {
+	if (!RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", L"AppsUseLightTheme", RRF_RT_DWORD, NULL, &value, &size)) {
 		return !value; // 'value' is true for light mode
 	} else {
 		return true; // Default to dark mode
@@ -670,7 +697,7 @@ static u32 GetAccentColor(void)
 {
 	ULONG value;
 	ULONG size = sizeof value;
-	if (!RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\DWM\\", L"AccentColor", RRF_RT_DWORD, null, &value, &size)) {
+	if (!RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\DWM\\", L"AccentColor", RRF_RT_DWORD, NULL, &value, &size)) {
 		return value;
 	} else {
 		//       AABBGGRR
@@ -682,13 +709,19 @@ static void SetAutorun(bool enabled, u16 *keyname, u16 *args)
 {
 	string filepath;
 	string target;
-	filepath.length = GetModuleFileNameW(null, filepath.text, countof(filepath.text)-1); // Get filepath of current module
+	filepath.length = GetModuleFileNameW(NULL, filepath.text, countof(filepath.text)-1); // Get filepath of current module
+	if (filepath.length <= 0) {
+		filepath.length = -1;
+	}
 	StringCchPrintfW(target.text, countof(target.text)-1, L"\"%s\" %s", filepath.text, args);
-	target.length = wcslen(target.text);
+	target.length = StringLength(target.text, countof(target.text));
+	if (target.length <= 0) {
+		target.length = -1;
+	}
 	HKEY regkey;
 	i32 success; // BUG Not checking 'success' below
 	if (enabled) {
-		success = RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, null, 0, KEY_SET_VALUE, null, &regkey, null);
+		success = RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, NULL, 0, KEY_SET_VALUE, NULL, &regkey, NULL);
 		success = RegSetValueExW(regkey, keyname, 0, REG_SZ, (UCHAR *)target.text, target.length * sizeof *target.text); // TODO Oof, that's a nasty cast
 		success = RegCloseKey(regkey);
 	} else {
@@ -702,7 +735,7 @@ static void SetAutorun(bool enabled, u16 *keyname, u16 *args)
 static int GetRegKey(u16 *keyname) {
 	ULONG value;
 	ULONG size = sizeof value;
-	if (!RegGetValueW(HKEY_CURRENT_USER, L"Software\\stianhoiland\\cmdtab\\", keyname, RRF_RT_DWORD, null, &value, &size)) {
+	if (!RegGetValueW(HKEY_CURRENT_USER, L"Software\\stianhoiland\\cmdtab\\", keyname, RRF_RT_DWORD, NULL, &value, &size)) {
 		return value;
 	} else {
 		return -1;
@@ -712,7 +745,7 @@ static int GetRegKey(u16 *keyname) {
 static void SetRegKey(u16 *keyname, int value) {
 	HKEY regkey;
 	i32 success; // BUG Not checking 'success' below
-	success = RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\stianhoiland\\cmdtab\\", 0, null, 0, KEY_SET_VALUE, null, &regkey, null);
+	success = RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\stianhoiland\\cmdtab\\", 0, NULL, 0, KEY_SET_VALUE, NULL, &regkey, NULL);
 	success = RegSetValueExW(regkey, keyname, 0, REG_DWORD, (VOID *)&value, 4);
 	success = RegCloseKey(regkey);
 	(void)success;
@@ -762,7 +795,7 @@ static void ShowWindowX(handle hwnd) // ShowWindow already taken
 		} else {
 			Log(L"ERROR couldn't switch to:");
 			LogWindow(hwnd);
-		    PlaySound(L"SystemHand", null, SND_ASYNC);
+			PlaySound(L"SystemHand", NULL, SND_ASYNC);
 			//HideSwitcher(); // need forward decl
 		}
 	} else {
@@ -825,7 +858,8 @@ static void AttachDebugConsole(wchar_t *title)
 // cmdtab impl
 //==============================================================================
 
-struct ini { // cmdtab settings
+// Settings
+struct ini {
 	// Hotkeys
 	struct { u32 mod, key, enabled; } hotkeyForApps;
 	struct { u32 mod, key, enabled; } hotkeyForWindows;
@@ -841,7 +875,7 @@ struct ini { // cmdtab settings
 	u32 switcherHorzMargin;
 	u32 switcherVertMargin;
 	u32 iconSize;
-	u32 iconHorzPadding;
+	u32 iconHorzMargin;
 	u32 fontSize;
 	u32 previewWidth;       // Width of a window preview cell in the window bar
 	u32 previewHeight;      // Height of the thumbnail area of a preview cell
@@ -851,17 +885,30 @@ struct ini { // cmdtab settings
 	u32 barGap;             // Vertical gap between the window bar and the main switcher
 	// Blacklist
 	struct identifier {
-		u16 *filename;          // Filename without file extension, ex. "explorer". Can be null
-		u16 *windowClass;       // Window class name. Can be null
+		u16 *filename;          // Filename without file extension, ex. "explorer". Can be NULL
+		u16 *windowClass;       // Window class name. Can be NULL
 	} blacklist[32];
 };
 
 struct app {
 	string path;                // Full path of app executable
-	string name;                // Product description/name, or filename without extension as fallback
+	string title;               // Product description/name from ver. info, or filename without extension as fallback
 	handle icon;                // Big app icon
 	handle windows[64];         // App windows that can be switched to
 	iz windowsCount;            // Number of elements in 'windows' array
+};
+
+struct gui {
+	f32 drawScale; // DPI scale of the monitor where the cursor is, which is where the switcher will be displayed
+	RECT drawRect; // Size of the scaled off-screen bitmap
+	u32 switcherHorzMargin;
+	u32 switcherVertMargin;
+	u32 iconSize;
+	u32 iconHorzMargin;
+	u32 selOutline;
+	u32 selRadius;
+	u32 selHorzOff;
+	u32 selVertOff;
 };
 
 static handle      Mutex;           // Singleton mutex to prevent running more than one cmdtab instance
@@ -870,7 +917,7 @@ static handle      HistoryHooks[2]; // Hook handles for WinEvent window activati
 static handle      History[128];    // Window handles from window activation events (MRU). Deduplicated, so prior activations are moved to the front
 static iz          HistoryCount;    // Number of elements in 'History' array
 static handle      KeyboardHook;    // Handle for low-level keyboard hook
-static u16         Keyboard[16];    // 256 bits to track key repeat for low-level keyboard hook
+static u8          Keyboard[32];    // 256 bits to track key repeat for low-level keyboard hook
 static struct app  Apps[128];       // Apps to be displayed in switcher
 static iz          AppsCount;       // Number of elements in 'Apps' array
 static struct app *SelectedApp;     // Pointer to one of the elements in 'Apps' array. The app for the 'SelectedWindow'
@@ -879,8 +926,14 @@ static handle     *SelectedWindow;  // Currently selected window in switcher. No
 static handle      Switcher;        // Handle for main window (aka. switcher)
 static handle      DrawingContext;  // Drawing context for double-buffered drawing of switcher window
 static handle      DrawingBitmap;   // Off-screen bitmap used for double-buffered drawing of switcher
-static RECT        DrawingRect;     // Size of the off-screen bitmap
-static f32         DrawingScale;    // DPI scale of the monitor where the cursor is, which is where the switcher will be displayed
+static struct gui  DrawingDims;     // Scaled dimensions of GUI elements. Updated on resize
+static HBRUSH      DrawingBg;       // Window background
+static HBRUSH      SelectionBg;     // Selection background
+static HPEN        SelectionOutline;// Selection rectangle pen
+static HPEN        MouseOutline;    // Mouseover rectangle pen
+static HPEN        NoneOutline;     // Pen with window background color
+static HFONT       BadgeFont;       // Font for the window count badge on app icons
+static f32         BadgeFontScale;  // DPI scale that 'BadgeFont' was created for
 static i32         MouseX, MouseY;  // Mouse position, for highlighting and clicking app icons in switcher
 // GUI, window bar (the secondary switcher that floats above the main one, with
 // live previews of the selected app's windows)
@@ -897,6 +950,8 @@ enum mode {
 	MODE_WINDOWS, // Cycling windows of the selected app (Alt-Backquote)
 };
 static enum mode   Mode;             // Which level of the switcher the user is navigating
+static bool        MouseDown;       // Is left mouse button down?
+static struct app *MouseApp;        // Pointer to one of the elements in 'Apps' array. The app under MouseX,MouseY
 
 //================
 // Initialization
@@ -927,7 +982,7 @@ static void InitConfig(void)
 		.switcherHorzMargin      =  24,
 		.switcherVertMargin      =  32,
 		.iconSize                =  64,
-		.iconHorzPadding         =   8,
+		.iconHorzMargin          =   8,
 		.fontSize                =  16,
 		.previewWidth            = 200,
 		.previewHeight           = 120,
@@ -937,7 +992,7 @@ static void InitConfig(void)
 		.barGap                  =  12,
 		// Blacklist
 		.blacklist = {
-			{ null,                       L"ApplicationFrameWindow" },
+			{ NULL,                       L"ApplicationFrameWindow" },
 			{ L"SearchHost",              L"Windows.UI.Core.CoreWindow" },
 			{ L"StartMenuExperienceHost", L"Windows.UI.Core.CoreWindow" },
 		},
@@ -950,10 +1005,9 @@ static void InitConfig(void)
 	Config.hotkeyForWindows.mod = MapVirtualKeyW(Config.hotkeyForWindows.mod, MAPVK_VSC_TO_VK_EX);
 	Config.hotkeyForWindows.key = MapVirtualKeyW(Config.hotkeyForWindows.key, MAPVK_VSC_TO_VK_EX);
 
-	Config.darkmode = IsDarkModeEnabled();
-
 	Config.groupByApp = GetRegKey(L"groupByApp");
 
+	Config.darkmode = IsDarkModeEnabled();
 	Log(L"darkmode %s\n", Config.darkmode ? L"YES" : L"NO");
 }
 
@@ -976,27 +1030,27 @@ static void AskAutorun(void)
 
 static bool AlreadyRunning(void)
 {
-	Mutex = CreateMutexW(null, true, L"cmdtabMutex");
+	Mutex = CreateMutexW(NULL, true, L"cmdtabMutex");
 	return GetLastError() == ERROR_ALREADY_EXISTS;
 }
 
 static void QuitSecondInstance(void)
 {
-	MessageBoxW(null, L"cmdtab is already running.", L"cmdtab", MB_OK | MB_ICONINFORMATION | MB_TASKMODAL);
+	MessageBoxW(NULL, L"cmdtab is already running.", L"cmdtab", MB_OK | MB_ICONINFORMATION | MB_TASKMODAL);
 	ExitProcess(0);
 }
 
 static void InitWindowActivationTracking(void)
 {
 	// Install event hooks for foreground window changes. Raymond Chen: https://devblogs.microsoft.com/oldnewthing/20130930-00/?p=3083
-	HistoryHooks[0] = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, null, EventHookProcedure, 0, 0, WINEVENT_OUTOFCONTEXT);
-	HistoryHooks[1] = SetWinEventHook(EVENT_OBJECT_UNCLOAKED, EVENT_OBJECT_UNCLOAKED, null, EventHookProcedure, 0, 0, WINEVENT_OUTOFCONTEXT);
+	HistoryHooks[0] = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, NULL, EventHookProcedure, 0, 0, WINEVENT_OUTOFCONTEXT);
+	HistoryHooks[1] = SetWinEventHook(EVENT_OBJECT_UNCLOAKED, EVENT_OBJECT_UNCLOAKED, NULL, EventHookProcedure, 0, 0, WINEVENT_OUTOFCONTEXT);
 }
 
 static void InitKeyboardHook(void)
 {
 	// Install keyboard hook
-	KeyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardHookProcedure, null, 0);
+	KeyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardHookProcedure, NULL, 0);
 }
 
 static void InitSwitcherWindow(handle instance)
@@ -1006,10 +1060,10 @@ static void InitSwitcherWindow(handle instance)
 	wcex.cbSize = sizeof wcex;
 	wcex.lpfnWndProc = SwitcherWindowProcedure;
 	wcex.hInstance = instance;
-	wcex.hCursor = LoadCursorW(null, IDC_ARROW);
+	wcex.hCursor = LoadCursorW(NULL, IDC_ARROW);
 	wcex.lpszClassName = L"cmdtabSwitcher";
 	// TOOLWINDOW so the switcher itself does not appear as an Alt-Tab window (see IsAltTabWindow)
-	Switcher = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, MAKEINTATOM(RegisterClassExW(&wcex)), null, 0, 0, 0, 0, 0, null, null, instance, null);
+	Switcher = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, MAKEINTATOM(RegisterClassExW(&wcex)), NULL, 0, 0, 0, 0, 0, NULL, NULL, instance, NULL);
 	// Clear all window styles for very plain window
 	SetWindowLongW(Switcher, GWL_STYLE, 0);
 	// Rounded window corners
@@ -1025,9 +1079,9 @@ static void InitWindowBarWindow(handle instance)
 	wcex.cbSize = sizeof wcex;
 	wcex.lpfnWndProc = WindowBarProcedure;
 	wcex.hInstance = instance;
-	wcex.hCursor = LoadCursorW(null, IDC_ARROW);
+	wcex.hCursor = LoadCursorW(NULL, IDC_ARROW);
 	wcex.lpszClassName = L"cmdtabWindowBar";
-	WindowBar = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, MAKEINTATOM(RegisterClassExW(&wcex)), null, 0, 0, 0, 0, 0, null, null, instance, null);
+	WindowBar = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, MAKEINTATOM(RegisterClassExW(&wcex)), NULL, 0, 0, 0, 0, 0, NULL, NULL, instance, NULL);
 	SetWindowLongW(WindowBar, GWL_STYLE, 0);
 	DWM_WINDOW_CORNER_PREFERENCE corners = DWMWCP_ROUND;
 	DwmSetWindowAttribute(WindowBar, DWMWA_WINDOW_CORNER_PREFERENCE, &corners, sizeof corners);
@@ -1052,7 +1106,7 @@ static int RunCmdTab(handle instance, u16 *args)
 	InitConfig();
 
 	//
-	i32 _ = CoInitialize(null);
+	i32 _ = CoInitialize(NULL);
 
 	InitSwitcherWindow(instance);
 	InitWindowBarWindow(instance);
@@ -1067,7 +1121,7 @@ static int RunCmdTab(handle instance, u16 *args)
 	// Run message loop
 	// Unfiltered, so both the switcher and the window bar get their messages.
 	// Quit is signalled by PostQuitMessage in the switcher's WM_DESTROY
-	for (MSG msg; GetMessageW(&msg, null, 0, 0) > 0;) DispatchMessageW(&msg); // Not handling -1 errors. Whatever
+	for (MSG msg; GetMessageW(&msg, NULL, 0, 0) > 0;) DispatchMessageW(&msg); // Not handling -1 errors. Whatever
 
 	// Uninstall keyboard & event hooks
 	UnhookWindowsHookEx(KeyboardHook);
@@ -1083,7 +1137,7 @@ static int RunCmdTab(handle instance, u16 *args)
 	bool hasLeaks = _CrtDumpMemoryLeaks();
 	Log(L"leaks? %s\n", hasLeaks ? L"YES" : L"No leaks.");
 	if (hasLeaks) {
-		Error(null, L"There were memory leaks.");
+		Error(NULL, L"There were memory leaks.");
 	}
 	return hasLeaks;
 }
@@ -1129,9 +1183,9 @@ static bool WindowIsBlacklisted(string *filename, string *windowClass)
 
 	// Iterate blacklist. I allow three kinds of entries in the black list:
 	// 1) {name,class} both name and class are specified and both must match
-	// 2) {name,null}  only name is specified and must match
-	// 3) {null,class} only class is specified and must match
-	// 4) {null,null}  terminates array
+	// 2) {name,NULL}  only name is specified and must match
+	// 3) {NULL,class} only class is specified and must match
+	// 4) {NULL,NULL}  terminates array
 
 	for (iz i = 0; i < countof(Config.blacklist); i++) {
 		struct identifier ignored = Config.blacklist[i];
@@ -1181,7 +1235,7 @@ static void AddToHistory(handle hwnd) {
 	}
 	// Get module filepath, abort if failed (most likely access denied)
 	string filepath = GetExePath(hwnd);
-	if (!filepath.ok) {
+	if (filepath.length <= 0) {
 		return; // Don't have to print error, since GetExePath already does that
 	}
 	// Check window against user-defined blacklist
@@ -1220,7 +1274,7 @@ static void AddToApps(handle hwnd)
 	}
 	// 3. Get module filepath, abort if failed (most likely access denied)
 	string filepath = GetExePath(hwnd);
-	if (!filepath.ok) {
+	if (filepath.length <= 0) {
 		return; // Don't have to print error, since GetExePath already does that
 	}
 	// 4. Check window against user-defined blacklist
@@ -1233,7 +1287,7 @@ static void AddToApps(handle hwnd)
 		return;
 	}
 	// 5. Find existing app with same module filepath
-	struct app *app = null;
+	struct app *app = NULL;
 	for (int i = 0; i < AppsCount; i++) {
 		if (StringsAreEqual(&filepath, &Apps[i].path)) {
 			app = &Apps[i];
@@ -1252,7 +1306,7 @@ static void AddToApps(handle hwnd)
 		struct app *window = &Apps[AppsCount++];
 		if (window->icon) DestroyIcon(window->icon);
 		window->path = app->path;
-		window->name = GetWindowTitle(hwnd);
+		window->title = GetWindowTitle(hwnd);
 		window->icon = app->icon; // TODO Does this lead to double free app->icon?
 		window->windowsCount = 0;
 		//
@@ -1271,10 +1325,10 @@ static void AddToApps(handle hwnd)
 		if (!Config.groupByApp) {
 			title = GetWindowTitle(hwnd); // TODO Fall back to app name for empty window titles
 		} else {
-			if (aumid.ok) {
+			if (aumid.length > 0) {
 				title = GetPackagedAppName(&aumid);
 			}
-			if (!title.ok) {
+			if (title.length <= 0) {
 				title = GetAppName(&filepath);
 			}
 		}
@@ -1283,8 +1337,8 @@ static void AddToApps(handle hwnd)
 		// list logo is often only 88x88 (ex. Claude), which looks blurry blown
 		// up to our icon size. A packaged app whose .exe embeds no icon at all
 		// (ex. WhatsApp) is exactly the case the manifest logo is needed for
-		handle icon = null;
-		if (aumid.ok && !ExeHasIcon(&filepath)) {
+		handle icon = NULL;
+		if (aumid.length > 0 && !ExeHasIcon(&filepath)) {
 			icon = GetPackagedAppIcon(&aumid);
 		}
 		if (!icon) {
@@ -1295,7 +1349,7 @@ static void AddToApps(handle hwnd)
 		app = &Apps[AppsCount++];
 		if (app->icon) DestroyIcon(app->icon); // In fact, I have to do a little lazy cleanup
 		app->path = filepath;
-		app->name = title;
+		app->title = title;
 		app->icon = icon;
 		app->windowsCount = 0; // Same truncation trick here (but hwnds are not structs, so no fields to overwrite)
 	}
@@ -1313,8 +1367,8 @@ static void AddToApps(handle hwnd)
 static void ActivateWindow(handle hwnd)
 {
 	// Find existing app and window
-	struct app *app = null;
-	handle *window = null;
+	struct app *app = NULL;
+	handle *window = NULL;
 	for (int i = 0; i < AppsCount; i++) {
 		app = &Apps[i];
 		for (int j = 0; j < app->windowsCount; j++) {
@@ -1381,8 +1435,8 @@ static void SelectFirstApp(void)
 		SelectedApp = &Apps[0];
 		SelectedWindow = &Apps[0].windows[0];
 	} else {
-		SelectedApp = null;
-		SelectedWindow = null;
+		SelectedApp = NULL;
+		SelectedWindow = NULL;
 		Log(L"nothing to select\n");
 	}
 	/*dbg*/
@@ -1492,7 +1546,12 @@ static void SelectNextWindow(bool reverse, bool wrap)
 static void ResizeSwitcher(void)
 {
 	// Get DPI of monitor where the mouse pointer is
-	DrawingScale = GetDpiForMouseMonitor() / 96.0;
+	f32 scale = GetDpiForMouseMonitor() / 96.0;
+
+	u32 iconSize           = scale * Config.iconSize;
+	u32 iconHorzMargin     = scale * Config.iconHorzMargin;
+	u32 switcherHorzMargin = scale * Config.switcherHorzMargin;
+	u32 switcherVertMargin = scale * Config.switcherVertMargin;
 
 	// Use the monitor where the mouse pointer is currently placed (#5)
 	POINT mousePos = {0};
@@ -1500,12 +1559,12 @@ static void ResizeSwitcher(void)
 	GetCursorPos(&mousePos);
 	GetMonitorInfoW(MonitorFromPoint(mousePos, MONITOR_DEFAULTTONEAREST), &mi);
 
-	u32     iconsWidth = DrawingScale * (AppsCount * Config.iconSize);
-	u32   paddingWidth = DrawingScale * (AppsCount * Config.iconHorzPadding * 2);
-	u32    marginWidth = DrawingScale *         (2 * Config.switcherHorzMargin);
-	u32       iconRows = 1;
-	u32    iconsHeight = DrawingScale *  (iconRows * Config.iconSize);
-	u32   marginHeight = DrawingScale *         (2 * Config.switcherVertMargin);
+	u32   iconsWidth = AppsCount * iconSize;
+	u32 paddingWidth = AppsCount * iconHorzMargin * 2;
+	u32  marginWidth =         2 * switcherHorzMargin;
+	u32     iconRows = 1;
+	u32  iconsHeight =  iconRows * iconSize;
+	u32 marginHeight =         2 * switcherVertMargin;
 
 	u32 w = iconsWidth + paddingWidth + marginWidth;
 	u32 h = iconsHeight + marginHeight;
@@ -1518,18 +1577,146 @@ static void ResizeSwitcher(void)
 	MouseX = 0;
 	MouseY = 0;
 
-	// Resize off-screen double-buffering bitmap
+	// Resize off-screen double-buffering bitmap and save calculated dimensions
 	RECT resized = {x, y, x+w, y+h};
-	if (!EqualRect(&DrawingRect, &resized)) {
+	if (!EqualRect(&DrawingDims.drawRect, &resized)) {
+		DrawingDims.drawRect           = resized;
+		DrawingDims.drawScale          = scale;
+		DrawingDims.iconSize           = iconSize;
+		DrawingDims.iconHorzMargin     = iconHorzMargin;
+		DrawingDims.switcherHorzMargin = switcherHorzMargin;
+		DrawingDims.switcherVertMargin = switcherVertMargin;
+		DrawingDims.selOutline         = scale *  3.5;
+		DrawingDims.selRadius          = scale * 10;
+		DrawingDims.selHorzOff         = scale *  6; // Selection rectangle offset (actual pixel offsets depends on SEL_RADIUS)
+		DrawingDims.selVertOff         = scale * 10; // Selection rectangle offset (actual pixel offsets depends on SEL_RADIUS)
+
 		handle context = GetDC(Switcher);
-		DeleteObject(DrawingBitmap);
 		DeleteDC(DrawingContext);
-		DrawingRect = resized;
 		DrawingContext = CreateCompatibleDC(context);
-		DrawingBitmap = CreateCompatibleBitmap(context, DrawingRect.right - DrawingRect.left, DrawingRect.bottom - DrawingRect.top);
+		DeleteObject(DrawingBitmap);
+		DrawingBitmap = CreateCompatibleBitmap(context, DrawingDims.drawRect.right - DrawingDims.drawRect.left, DrawingDims.drawRect.bottom - DrawingDims.drawRect.top);
 		handle oldBitmap = (handle)SelectObject(DrawingContext, DrawingBitmap);
 		DeleteObject(oldBitmap);
 		ReleaseDC(Switcher, context);
+	}
+}
+
+static void DrawApp(struct app *app, RECT appRect, RECT windowRect)
+{
+	u32 ICON_WIDTH = DrawingDims.iconSize;
+	u32 ICON_PAD   = DrawingDims.iconHorzMargin;
+
+	u32 SEL_OUTLINE  = DrawingDims.selOutline;
+	u32 SEL_RADIUS   = DrawingDims.selRadius;
+	u32 SEL_HORZ_OFF = DrawingDims.selHorzOff;
+	u32 SEL_VERT_OFF = DrawingDims.selVertOff;
+
+	i32  width = ICON_WIDTH;
+	i32 height = ICON_WIDTH;
+
+	bool hasMouseover = MouseApp != NULL;
+	bool hasMousedown = hasMouseover && MouseDown;
+	bool isSelected = SelectedApp == app && app;
+	bool isMouseover = MouseApp == app && app;
+	bool isMousedown = hasMousedown && isMouseover;
+
+	// Select background brush for RoundRect (used to draw selection rectangle background)
+	HBRUSH backgroundBrush;
+	if ((isSelected && !hasMouseover) || isMouseover) {
+		backgroundBrush = SelectionBg;
+	} else {
+		backgroundBrush = DrawingBg;
+	}
+	HBRUSH oldBrush = (HBRUSH)SelectObject(DrawingContext, backgroundBrush);
+
+	// Select foreground pen for RoundRect (used to draw selection rectangle)
+	HPEN foregroundPen;
+	if ((isSelected && !hasMousedown) || isMousedown) {
+		foregroundPen = SelectionOutline;
+	} else if (isMouseover) {
+		foregroundPen = MouseOutline;
+	} else {
+		foregroundPen = NoneOutline;
+	}
+	HPEN oldPen = (HPEN)SelectObject(DrawingContext, foregroundPen);
+
+	if (isSelected) {
+		// Draw selection rectangle and icon, with selection background and rectangle
+		RoundRect(DrawingContext, appRect.left - SEL_VERT_OFF, appRect.top - SEL_HORZ_OFF, appRect.right + SEL_VERT_OFF, appRect.bottom + SEL_HORZ_OFF, SEL_RADIUS, SEL_RADIUS);
+		DrawIconEx(DrawingContext, appRect.left, appRect.top, app->icon, width, height, 0, backgroundBrush, DI_NORMAL);
+	} else if (isMouseover) {
+		// Draw selection rectangle and icon, with selection background and mouseover rectangle
+		RoundRect(DrawingContext, appRect.left - SEL_VERT_OFF, appRect.top - SEL_HORZ_OFF, appRect.right + SEL_VERT_OFF, appRect.bottom + SEL_HORZ_OFF, SEL_RADIUS, SEL_RADIUS);
+		DrawIconEx(DrawingContext, appRect.left, appRect.top, app->icon, width, height, 0, backgroundBrush, DI_NORMAL);
+	} else {
+		// Draw icon with window background
+		DrawIconEx(DrawingContext, appRect.left, appRect.top, app->icon, width, height, 0, backgroundBrush, DI_NORMAL);
+	}
+
+	if ((isSelected && !hasMouseover) || isMouseover) {
+		// Add window count to app name
+		string title = {0};
+		if (app->windowsCount > 1) {
+			title.length = swprintf(title.text, countof(title.text), L"%ls (%u)", app->title.text, app->windowsCount);
+		} else {
+			title.length = swprintf(title.text, countof(title.text), L"%ls", app->title.text);
+		}
+		if (title.length <= 0) {
+			title.length = -1;
+		}
+
+		// Draw app name
+		u16 *titleText = title.text;
+		RECT titleRect = {0}; // DrawTextW uses a destination rect for drawing
+
+		// Measure text width
+		DrawTextW(DrawingContext, titleText, -1, &titleRect, DT_CALCRECT | DT_SINGLELINE | DT_CENTER | DT_BOTTOM);
+		i32 titleWidth = (titleRect.right - titleRect.left) + 2; // Hmm, measured size seems a teensy bit too small, so +2
+
+		titleRect.left = appRect.left;
+		titleRect.right = appRect.right;
+		titleRect.bottom = windowRect.bottom;
+
+		i32 widthDiff = titleWidth - (titleRect.right - titleRect.left);
+		if (widthDiff > 0) {
+			// titleRect is too small for text, grow the rect
+			titleRect.left  -= (i32)ceil(widthDiff / 2.0);
+			titleRect.right += (i32)floor(widthDiff / 2.0);
+		}
+
+		titleRect.bottom -= ICON_PAD; // *** this lifts the app text up a little ***
+
+		// If the app name, when centered, extends past window bounds, adjust label position to be inside window bounds
+		if (titleRect.right > windowRect.right) {
+			titleRect.left -= (titleRect.right - windowRect.right) + ICON_PAD;
+			titleRect.right = windowRect.right - ICON_PAD;
+		}
+		if (titleRect.left < 0) {
+			titleRect.right += ICON_PAD + abs(titleRect.left);
+			titleRect.left   = ICON_PAD + 0;
+		}
+
+		///* dbg */ FillRect(DrawingContext, &titleRect, CreateSolidBrush(RGB(255, 0, 0))); // Check the size of the text box
+		DrawTextW(DrawingContext, titleText, -1, &titleRect, DT_SINGLELINE | DT_CENTER | DT_BOTTOM);
+	}
+
+	// Window count badge on the top right of the icon, for apps with
+	// multiple windows (only meaningful when grouping by app)
+	if (Config.groupByApp && app->windowsCount > 1) {
+		u16 count[8];
+		swprintf(count, countof(count), L"%lld", (i64)app->windowsCount);
+		i32 badgeSize  = DrawingDims.drawScale * 22;
+		i32 badgeBleed = DrawingDims.drawScale *  6; // How far the badge pokes out past the icon's corner
+		RECT badgeRect = {appRect.right + badgeBleed - badgeSize, appRect.top - badgeBleed, appRect.right + badgeBleed, appRect.top - badgeBleed + badgeSize};
+		HPEN oldBadgePen = (HPEN)SelectObject(DrawingContext, GetStockObject(NULL_PEN));
+		HBRUSH oldBadgeBrush = (HBRUSH)SelectObject(DrawingContext, SelectionBg);
+		Ellipse(DrawingContext, badgeRect.left, badgeRect.top, badgeRect.right, badgeRect.bottom);
+		HFONT oldBadgeFont = (HFONT)SelectObject(DrawingContext, BadgeFont);
+		DrawTextW(DrawingContext, count, -1, &badgeRect, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+		SelectObject(DrawingContext, oldBadgeFont);
+		SelectObject(DrawingContext, oldBadgeBrush);
+		SelectObject(DrawingContext, oldBadgePen);
 	}
 }
 
@@ -1539,70 +1726,52 @@ static void RedrawSwitcher(void)
 
 	COLORREF WIN_COLOR_BG = RGB(32, 32, 32); // dark mode?
 	COLORREF TXT_COLOR    = RGB(235, 235, 235);
-	COLORREF SEL_COLOR    = RGB(76, 194, 255); // Sampled from Windows 11 Alt-Tab
+	COLORREF SEL_COLOR    = GetAccentColor() & 0x00FFFFFF; // RGB(76, 194, 255); // Sampled from Windows 11 Alt-Tab
 	COLORREF SEL_COLOR_BG = RGB(11, 11, 11); // Sampled from Windows 11 Alt-Tab
+	COLORREF MOUSE_COLOR  = RGB(40, 40, 40); // Sampled from Windows 11 Alt-Tab
 
-	u32 ICON_WIDTH = DrawingScale * Config.iconSize;
-	u32 ICON_PAD   = DrawingScale * Config.iconHorzPadding;
-	u32 HORZ_PAD   = DrawingScale * Config.switcherHorzMargin;
-	u32 VERT_PAD   = DrawingScale * Config.switcherVertMargin;
+	u32 ICON_WIDTH = DrawingDims.iconSize;
+	u32 ICON_PAD   = DrawingDims.iconHorzMargin;
+	u32 HORZ_PAD   = DrawingDims.switcherHorzMargin;
+	u32 VERT_PAD   = DrawingDims.switcherVertMargin;
 
-	u32 SEL_OUTLINE  = DrawingScale *  3.5;
-	u32 SEL_RADIUS   = DrawingScale * 10;
-	u32 SEL_VERT_OFF = DrawingScale * 10; // Selection rectangle offset (actual pixel offsets depends on SEL_RADIUS)
-	u32 SEL_HORZ_OFF = DrawingScale *  6; // Selection rectangle offset (actual pixel offsets depends on SEL_RADIUS)
+	u32 SEL_OUTLINE = DrawingDims.selOutline;
 
-	static HBRUSH windowBackground = {0};
-	static HBRUSH selectionBackground = {0};
-	static HBRUSH selectionColor = {0};
-	static HPEN selectionOutline = {0};
-	static HBRUSH badgeBackground = {0};
-	static HFONT badgeFont = {0};
-	static f32 badgeFontScale = 0;
+	// Init drawing brushes
+	if (!DrawingBg) DrawingBg = CreateSolidBrush(WIN_COLOR_BG);
+	if (!SelectionBg) SelectionBg = CreateSolidBrush(SEL_COLOR_BG);
+	if (!SelectionOutline) SelectionOutline = CreatePen(PS_SOLID, SEL_OUTLINE, SEL_COLOR);
+	if (!MouseOutline) MouseOutline = CreatePen(PS_SOLID, SEL_OUTLINE, MOUSE_COLOR);
+	if (!NoneOutline) NoneOutline = CreatePen(PS_SOLID, SEL_OUTLINE, WIN_COLOR_BG);
 
-	// Init background brushes (static vars)
-	if (windowBackground == null) {
-		windowBackground = CreateSolidBrush(WIN_COLOR_BG);
+	// Init window count badge font, which depends on the DPI scale
+	if (!BadgeFont || BadgeFontScale != DrawingDims.drawScale) {
+		if (BadgeFont) DeleteObject(BadgeFont);
+		BadgeFont = CreateFontW(-(i32)(DrawingDims.drawScale * 12), 0, 0, 0, FW_SEMIBOLD, false, false, false, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+		BadgeFontScale = DrawingDims.drawScale;
 	}
-	if (selectionBackground == null) {
-		selectionBackground = CreateSolidBrush(SEL_COLOR_BG);
-	}
-	if (selectionColor == null) {
-		selectionColor = CreateSolidBrush(GetAccentColor() & 0x00FFFFFF); // SEL_COLOR
-	}
-	if (selectionOutline == null) {
-		selectionOutline = CreatePen(PS_SOLID, SEL_OUTLINE, GetAccentColor() & 0x00FFFFFF); // SEL_COLOR
-	}
-	if (badgeBackground == null) {
-		badgeBackground = CreateSolidBrush(SEL_COLOR_BG);
-	}
-	if (badgeFont == null || badgeFontScale != DrawingScale) {
-		if (badgeFont) DeleteObject(badgeFont);
-		badgeFont = CreateFontW(-(i32)(DrawingScale * 12), 0, 0, 0, FW_SEMIBOLD, false, false, false, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-		badgeFontScale = DrawingScale;
-	}
+
+	// Select text color & background for DrawTextW (used to draw title text)
+	SetTextColor(DrawingContext, TXT_COLOR);
+	SetBkMode(DrawingContext, TRANSPARENT);
 
 	// Window rect
 	RECT windowRect = {0};
 	GetClientRect(Switcher, &windowRect);
 
-	// Invalidate & draw window background
-	RedrawWindow(Switcher, null, null, RDW_INVALIDATE | RDW_ERASE);
-	FillRect(DrawingContext, &windowRect, windowBackground);
+	// Fill window background
+	FillRect(DrawingContext, &windowRect, DrawingBg);
 
-	// Select pen & brush for RoundRect (used to draw selection rectangle)
-	HPEN oldPen = (HPEN)SelectObject(DrawingContext, selectionOutline);
-	HBRUSH oldBrush = (HBRUSH)SelectObject(DrawingContext, selectionBackground);
-
-	// Select text font, color & background for DrawTextW (used to draw title text)
+	// Select text font for DrawTextW (used to draw title text)
 	HFONT oldFont = (HFONT)SelectObject(DrawingContext, GetStockObject(DEFAULT_GUI_FONT));
-	SetTextColor(DrawingContext, TXT_COLOR);
-	SetBkMode(DrawingContext, TRANSPARENT);
 
 	// This is how GDI handles memory?
 	//DeleteObject(oldPen);
 	//DeleteObject(oldBrush);
 	//DeleteObject(oldFont);
+
+	RECT selectedRect = {0};
+	RECT mousedownRect = {0};
 
 	for (int i = 0; i < AppsCount; i++) {
 		struct app *app = &Apps[i];
@@ -1612,83 +1781,38 @@ static void RedrawSwitcher(void)
 		i32 right0 = i != 0 ? ICON_PAD : 0;
 
 		i32  icons = (ICON_PAD + ICON_WIDTH + ICON_PAD) * i;
-		i32   left = HORZ_PAD + left0 + icons + right0;
-		i32    top = VERT_PAD;
 		i32  width = ICON_WIDTH;
 		i32 height = ICON_WIDTH;
-		i32  right = left + width;
-		i32 bottom = top + height;
 
-		if (app != SelectedApp) {
-			// Draw only icon, with window background
-			DrawIconEx(DrawingContext, left, top, app->icon, width, height, 0, windowBackground, DI_NORMAL);
-		} else {
-			// Draw selection rectangle and icon, with selection background
-			RoundRect(DrawingContext, left - SEL_VERT_OFF, top - SEL_HORZ_OFF, right + SEL_VERT_OFF, bottom + SEL_HORZ_OFF, SEL_RADIUS, SEL_RADIUS);
-			DrawIconEx(DrawingContext, left, top, app->icon, width, height, 0, selectionBackground, DI_NORMAL);
+		RECT appRect = {0};
 
-			// Add window count to app name
-			string title = {0};
-			if (app->windowsCount > 1) {
-				title.length = swprintf(title.text, countof(title.text), L"%ls (%u)", app->name.text, app->windowsCount);
-			} else {
-				title.length = swprintf(title.text, countof(title.text), L"%ls", app->name.text);
-			}
-			title.ok = (title.length > 0);
+		appRect.left   = HORZ_PAD + left0 + icons + right0;
+		appRect.top    = VERT_PAD;
+		appRect.right  = appRect.left + width;
+		appRect.bottom = appRect.top + height;
 
-			// Draw app name
-			u16 *titleText = title.text;
-			RECT titleRect = {0}; // DrawTextW uses a destination rect for drawing
-
-			// Measure text width
-			DrawTextW(DrawingContext, titleText, -1, &titleRect, DT_CALCRECT | DT_SINGLELINE | DT_CENTER | DT_BOTTOM);
-			i32 titleWidth = (titleRect.right - titleRect.left) + 2; // Hmm, measured size seems a teensy bit too small, so +2
-
-			titleRect.left = left;
-			titleRect.right = right;
-			titleRect.bottom = windowRect.bottom;
-
-			i32 widthDiff = titleWidth - (titleRect.right - titleRect.left);
-			if (widthDiff > 0) {
-				// titleRect is too small for text, grow the rect
-				titleRect.left  -= (i32)ceil(widthDiff / 2.0);
-				titleRect.right += (i32)floor(widthDiff / 2.0);
-			}
-
-			titleRect.bottom -= ICON_PAD; // *** this lifts the app text up a little ***
-
-			// If the app name, when centered, extends past window bounds, adjust label position to be inside window bounds
-			if (titleRect.right > windowRect.right) {
-				titleRect.left -= (titleRect.right - windowRect.right) + ICON_PAD;
-				titleRect.right = windowRect.right - ICON_PAD;
-			}
-			if (titleRect.left < 0) {
-				titleRect.right += ICON_PAD + abs(titleRect.left);
-				titleRect.left   = ICON_PAD + 0;
-			}
-
-			///* dbg */ FillRect(DrawingContext, &titleRect, CreateSolidBrush(RGB(255, 0, 0))); // Check the size of the text box
-			DrawTextW(DrawingContext, titleText, -1, &titleRect, DT_SINGLELINE | DT_CENTER | DT_BOTTOM);
+		if (SelectedApp == app) {
+			selectedRect = appRect;
+		}
+		if (MouseApp == app && MouseDown) {
+			mousedownRect = appRect;
+		}
+		if (SelectedApp == app || (MouseApp == app && MouseDown)) {
+			continue; // Draw these later
 		}
 
-		// Window count badge on the top right of the icon, for apps with
-		// multiple windows (only meaningful when grouping by app)
-		if (Config.groupByApp && app->windowsCount > 1) {
-			u16 count[8];
-			swprintf(count, countof(count), L"%lld", (i64)app->windowsCount);
-			i32 badgeSize  = DrawingScale * 22;
-			i32 badgeBleed = DrawingScale *  6; // How far the badge pokes out past the icon's corner
-			RECT badgeRect = {right + badgeBleed - badgeSize, top - badgeBleed, right + badgeBleed, top - badgeBleed + badgeSize};
-			HPEN oldBadgePen = (HPEN)SelectObject(DrawingContext, GetStockObject(NULL_PEN));
-			HBRUSH oldBadgeBrush = (HBRUSH)SelectObject(DrawingContext, badgeBackground);
-			Ellipse(DrawingContext, badgeRect.left, badgeRect.top, badgeRect.right, badgeRect.bottom);
-			HFONT oldBadgeFont = (HFONT)SelectObject(DrawingContext, badgeFont);
-			DrawTextW(DrawingContext, count, -1, &badgeRect, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
-			SelectObject(DrawingContext, oldBadgeFont);
-			SelectObject(DrawingContext, oldBadgeBrush);
-			SelectObject(DrawingContext, oldBadgePen);
-		}
+		DrawApp(app, appRect, windowRect);
 	}
+
+	if (SelectedApp) {
+		DrawApp(SelectedApp, selectedRect, windowRect);
+	}
+	if (MouseApp && MouseDown) {
+		DrawApp(MouseApp, mousedownRect, windowRect);
+	}
+
+	// Invalidate window rectangle
+	RedrawWindow(Switcher, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
 }
 
 static struct app *GetAppForPosition(i32 x, i32 y)
@@ -1696,10 +1820,10 @@ static struct app *GetAppForPosition(i32 x, i32 y)
 	// Iteration logic copy/pasted from RedrawSwitcher, so if something changes
 	// there update this:
 
-	u32 ICON_WIDTH = DrawingScale * Config.iconSize;
-	u32 ICON_PAD   = DrawingScale * Config.iconHorzPadding;
-	u32 HORZ_PAD   = DrawingScale * Config.switcherHorzMargin;
-	u32 VERT_PAD   = DrawingScale * Config.switcherVertMargin;
+	u32 ICON_WIDTH = DrawingDims.iconSize;
+	u32 ICON_PAD   = DrawingDims.iconHorzMargin;
+	u32 HORZ_PAD   = DrawingDims.switcherHorzMargin;
+	u32 VERT_PAD   = DrawingDims.switcherVertMargin;
 
 	for (int i = 0; i < AppsCount; i++) {
 		struct app *app = &Apps[i];
@@ -1709,27 +1833,29 @@ static struct app *GetAppForPosition(i32 x, i32 y)
 		i32 right0 = i != 0 ? ICON_PAD : 0;
 
 		i32  icons = (ICON_PAD + ICON_WIDTH + ICON_PAD) * i;
-		i32   left = HORZ_PAD + left0 + icons + right0;
-		i32    top = VERT_PAD;
 		i32  width = ICON_WIDTH;
 		i32 height = ICON_WIDTH;
-		i32  right = left + width;
-		i32 bottom = top + height;
+
+		RECT appRect = {0};
+
+		appRect.left   = HORZ_PAD + left0 + icons + right0;
+		appRect.top    = VERT_PAD;
+		appRect.right  = appRect.left + width;
+		appRect.bottom = appRect.top + height;
 
 		// This is specific to GetAppForPosition
 		// Ignore padding for mouse selection, for uSaBiLiTy
-		left -= ICON_PAD;
-		top = 0;
-		height = DrawingRect.bottom - DrawingRect.top; // aka. switcherHeight
-		right += ICON_PAD;
-		bottom = top + height;
+		appRect.left  -= ICON_PAD;
+		appRect.right += ICON_PAD;
+		appRect.top    = 0;
+		appRect.bottom = appRect.top + (DrawingDims.drawRect.bottom - DrawingDims.drawRect.top); // aka. switcherHeight;
 
-		if (PtInRect(&(RECT){left, top, right, bottom}, (POINT){x, y})) {
+		if (PtInRect(&appRect, (POINT){x, y})) {
 			return app;
 		}
 	}
 
-	return null;
+	return NULL;
 }
 
 //============
@@ -1751,11 +1877,11 @@ struct barcell {
 static struct barcell GetWindowBarCell(iz index)
 {
 	// Cell layout in window bar client coordinates
-	u32 cellWidth   = DrawingScale * Config.previewWidth;
-	u32 thumbHeight = DrawingScale * Config.previewHeight;
-	u32 labelHeight = DrawingScale * Config.previewLabelHeight;
-	u32 labelGap    = DrawingScale * Config.previewLabelGap;
-	u32 padding     = DrawingScale * Config.previewPadding;
+	u32 cellWidth   = DrawingDims.drawScale * Config.previewWidth;
+	u32 thumbHeight = DrawingDims.drawScale * Config.previewHeight;
+	u32 labelHeight = DrawingDims.drawScale * Config.previewLabelHeight;
+	u32 labelGap    = DrawingDims.drawScale * Config.previewLabelGap;
+	u32 padding     = DrawingDims.drawScale * Config.previewPadding;
 	i32 left = padding + index * (cellWidth + padding);
 	i32 top  = padding;
 	struct barcell cell;
@@ -1769,7 +1895,7 @@ static void UnregisterThumbnails(void)
 	for (iz i = 0; i < ThumbnailsCount; i++) {
 		if (Thumbnails[i]) {
 			DwmUnregisterThumbnail(Thumbnails[i]);
-			Thumbnails[i] = null;
+			Thumbnails[i] = NULL;
 		}
 	}
 	ThumbnailsCount = 0;
@@ -1786,7 +1912,7 @@ static void RegisterThumbnails(void)
 		if (FAILED(DwmRegisterThumbnail(WindowBar, GetAppHost(SelectedApp->windows[i]), &Thumbnails[i]))) {
 			Log(L"WARNING couldn't register thumbnail for ");
 			LogWindow(SelectedApp->windows[i]);
-			Thumbnails[i] = null;
+			Thumbnails[i] = NULL;
 		}
 		ThumbnailsCount++;
 	}
@@ -1829,18 +1955,18 @@ static void ResizeWindowBar(void)
 	// Sized from the selected app's window count and positioned to float
 	// directly above the main switcher, horizontally centered on it. The
 	// switcher is always resized first (ResizeSwitcher), so DrawingScale and
-	// DrawingRect are current here
+	// DrawingDims.drawRect are current here
 	iz windowsCount = SelectedApp ? SelectedApp->windowsCount : 0;
 
-	u32 cellWidth  = DrawingScale * Config.previewWidth;
-	u32 cellHeight = DrawingScale * (Config.previewHeight + Config.previewLabelGap + Config.previewLabelHeight);
-	u32 padding    = DrawingScale * Config.previewPadding;
-	u32 gap        = DrawingScale * Config.barGap;
+	u32 cellWidth  = DrawingDims.drawScale * Config.previewWidth;
+	u32 cellHeight = DrawingDims.drawScale * (Config.previewHeight + Config.previewLabelGap + Config.previewLabelHeight);
+	u32 padding    = DrawingDims.drawScale * Config.previewPadding;
+	u32 gap        = DrawingDims.drawScale * Config.barGap;
 
 	u32 w = windowsCount * (cellWidth + padding) + padding; // TODO Overflows the monitor for very many windows
 	u32 h = cellHeight + 2 * padding;
-	i32 x = (DrawingRect.left + DrawingRect.right - (i32)w) / 2;
-	i32 y = DrawingRect.top - (i32)(gap + h);
+	i32 x = (DrawingDims.drawRect.left + DrawingDims.drawRect.right - (i32)w) / 2;
+	i32 y = DrawingDims.drawRect.top - (i32)(gap + h);
 
 	MoveWindow(WindowBar, x, y, w, h, false);
 
@@ -1866,9 +1992,9 @@ static void RedrawWindowBar(void)
 	COLORREF TXT_COLOR    = RGB(235, 235, 235);
 	COLORREF SEL_COLOR_BG = RGB(11, 11, 11);
 
-	u32 SEL_OUTLINE = DrawingScale * 3.5;
-	u32 SEL_RADIUS  = DrawingScale * 10;
-	u32 SEL_OFF     = DrawingScale *  6; // Selection rectangle inflation around the thumbnail area
+	u32 SEL_OUTLINE = DrawingDims.drawScale * 3.5;
+	u32 SEL_RADIUS  = DrawingDims.drawScale * 10;
+	u32 SEL_OFF     = DrawingDims.drawScale *  6; // Selection rectangle inflation around the thumbnail area
 
 	static HBRUSH windowBackground = {0};
 	static HBRUSH selectionBackground = {0};
@@ -1876,26 +2002,26 @@ static void RedrawWindowBar(void)
 	static HFONT labelFont = {0};
 	static f32 labelFontScale = 0;
 
-	if (windowBackground == null) {
+	if (windowBackground == NULL) {
 		windowBackground = CreateSolidBrush(WIN_COLOR_BG);
 	}
-	if (selectionBackground == null) {
+	if (selectionBackground == NULL) {
 		selectionBackground = CreateSolidBrush(SEL_COLOR_BG);
 	}
-	if (selectionOutline == null) {
+	if (selectionOutline == NULL) {
 		selectionOutline = CreatePen(PS_SOLID, SEL_OUTLINE, GetAccentColor() & 0x00FFFFFF);
 	}
-	if (labelFont == null || labelFontScale != DrawingScale) {
+	if (labelFont == NULL || labelFontScale != DrawingDims.drawScale) {
 		if (labelFont) DeleteObject(labelFont);
-		labelFont = CreateFontW(-(i32)(DrawingScale * 13), 0, 0, 0, FW_NORMAL, false, false, false, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
-		labelFontScale = DrawingScale;
+		labelFont = CreateFontW(-(i32)(DrawingDims.drawScale * 13), 0, 0, 0, FW_NORMAL, false, false, false, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+		labelFontScale = DrawingDims.drawScale;
 	}
 
 	RECT windowRect = {0};
 	GetClientRect(WindowBar, &windowRect);
 
 	// Invalidate & draw window background
-	RedrawWindow(WindowBar, null, null, RDW_INVALIDATE | RDW_ERASE);
+	RedrawWindow(WindowBar, NULL, NULL, RDW_INVALIDATE | RDW_ERASE);
 	FillRect(WindowBarContext, &windowRect, windowBackground);
 
 	if (!SelectedApp) {
@@ -1923,8 +2049,8 @@ static void RedrawWindowBar(void)
 		// title is empty (or was nothing but brackets)
 		string title = GetWindowTitle(SelectedApp->windows[i]);
 		title = StringWithoutBrackets(&title);
-		if (!title.ok) {
-			title = SelectedApp->name;
+		if (title.length <= 0) {
+			title = SelectedApp->title;
 		}
 		DrawTextW(WindowBarContext, title.text, title.length, &cell.label, DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
 	}
@@ -1975,7 +2101,7 @@ static void ShowSwitcher(void)
 static void SendModKeysUp(void)
 {
 	SendInput(2,
-		(INPUT[]) {
+		(INPUT[]){
 			(INPUT){.type = INPUT_KEYBOARD, .ki.wVk = Config.hotkeyForApps.mod, .ki.dwFlags = KEYEVENTF_KEYUP},
 			(INPUT){.type = INPUT_KEYBOARD, .ki.wVk = Config.hotkeyForWindows.mod, .ki.dwFlags = KEYEVENTF_KEYUP},
 		},
@@ -1998,8 +2124,9 @@ static void HideSwitcher(void)
 	HideWindow(Switcher);
 	LockSetForegroundWindow(LSFW_UNLOCK);
 	// Reset selection
-	SelectedApp = null;
-	SelectedWindow = null;
+	SelectedApp = NULL;
+	SelectedWindow = NULL;
+	MouseApp = NULL;
 	Mode = MODE_IDLE;
 }
 
@@ -2008,8 +2135,8 @@ static void HideSwitcher(void)
 //	if (AppsCount <= 0) {
 //		return;
 //	}
-//	struct app *app = null;
-//	handle *window = null;
+//	struct app *app = NULL;
+//	handle *window = NULL;
 //	for (int i = 0; i < AppsCount; i++) {
 //		app = &Apps[i];
 //		for (int j = 0; j < app->windowsCount; j++) {
@@ -2042,7 +2169,7 @@ static bool SetKey(u32 key, bool down)
 static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lparam)
 {
 	if (code < 0) { // "If code is less than zero, the hook procedure must pass the message to..." blah blah blah read the docs
-		return CallNextHookEx(null, code, wparam, lparam);
+		return CallNextHookEx(NULL, code, wparam, lparam);
 	}
 
 	KBDLLHOOKSTRUCT *kbd = (KBDLLHOOKSTRUCT *)lparam;
@@ -2059,7 +2186,7 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 		goto passMessage;
 	}
 
-	// (SelectedWindow == null) means Switcher is not active/visible
+	// (SelectedWindow == NULL) means Switcher is not active/visible
 	if (!SelectedWindow) {
 
 		bool keyRepeat = SetKey(keyCode, keyDown); // Manually track key repeat
@@ -2122,7 +2249,7 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 			goto consumeMessage;
 		}
 
-	} else { // (SelectedWindow != null) means switcher is active/visible
+	} else { // (SelectedWindow != NULL) means switcher is active/visible
 
 		bool mod1Up = keyCode == Config.hotkeyForApps.mod && !keyDown;
 		bool mod2Up = keyCode == Config.hotkeyForWindows.mod && !keyDown;
@@ -2236,11 +2363,11 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 			// Deactivation
 			// ========================================
 
-			bool escDown = keyCode == VK_ESCAPE && !keyDown;
-			bool enterDown = keyCode == VK_RETURN && !keyDown;
+			bool escUp = keyCode == VK_ESCAPE && !keyDown;
+			bool enterUp = keyCode == VK_RETURN && !keyDown;
 
 			// Alt-Enter - switch to selected window
-			if (enterDown) {
+			if (enterUp) {
 				ShowSelectedWindow();
 				HideSwitcher();
 				goto consumeMessage;
@@ -2248,7 +2375,7 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 			// Alt-Esc - cancel switching and restore initial window
 			// When the window bar is up, the first Esc only backs out of window
 			// switching, up to the app bar (State 3 -> State 2)
-			if (escDown) { // BUG There's a bug here if mod1Held and mod2Held aren't both the same key. In that case I'll still pass through the key event, even though I should own it since it's not Alt-Esc
+			if (escUp) { // BUG There's a bug here if mod1Held and mod2Held aren't both the same key. In that case I'll still pass through the key event, even though I should own it since it's not Alt-Esc
 				if (IsWindowVisible(WindowBar)) {
 					HideWindowBar();
 					Mode = MODE_APPS;
@@ -2269,7 +2396,7 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 			bool deleteDown = keyCode == VK_DELETE && keyDown;
 			bool keyMDown   = keyCode == 'M' && keyDown;
 			bool keyHDown   = keyCode == 'H' && keyDown;
-			bool keyBDown   = keyCode == 'B' && !keyDown;
+			bool keyBUp     = keyCode == 'B' && !keyDown;
 			bool keyGDown   = keyCode == 'G' && keyDown;
 
 			// Alt-F4 - quit cmdtab
@@ -2318,7 +2445,7 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 				goto consumeMessage;
 			}
 			// Alt-B - display app name and window class to user, to add in blacklist
-			if (keyBDown) {
+			if (keyBUp) {
 				handle selectedWindow = *SelectedWindow; // HideSwitcher resets SelectedWindow
 				HideSwitcher();
 				ReportWindowHandle(Switcher, selectedWindow);
@@ -2336,8 +2463,8 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 				UpdateApps();
 				ResizeSwitcher(); // Since we have called UpdateApps() above
 				// Find existing app and window
-				struct app *app = null;
-				handle *window = null;
+				struct app *app = NULL;
+				handle *window = NULL;
 				for (int i = 0; i < AppsCount; i++) {
 					app = &Apps[i];
 					for (int j = 0; j < app->windowsCount; j++) {
@@ -2358,7 +2485,7 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 			// ========================================
 			// Debug
 			// ========================================
-
+            #ifdef _DEBUG
 			bool keyF11Down = keyCode == VK_F11 && keyDown && !keyRepeat;
 			bool keyF12Down = keyCode == VK_F12 && keyDown && !keyRepeat;
 
@@ -2369,6 +2496,7 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 			if (keyF11Down) {
 				PrintApps();
 			}
+			#endif
 
 			// ========================================
 			// Hook management
@@ -2396,7 +2524,7 @@ static LRESULT CALLBACK KeyboardHookProcedure(int code, WPARAM wparam, LPARAM lp
 
 	passMessage:
 		//Log(L"passMessage\n");
-		return CallNextHookEx(null, code, wparam, lparam);
+		return CallNextHookEx(NULL, code, wparam, lparam);
 	consumeMessage:
 		// By returning a non-zero value from the hook procedure, the message
 		// is consumed and does not get passed to the target window
@@ -2415,7 +2543,7 @@ static i64 OnSwitcherCreate(void)
 
 static i64 OnSwitcherDPIChanged(u16 newDPI, RECT newRect)
 {
-	Log(L"WM_DPICHANGED, current scale: %f, new scale: %f\n", DrawingScale, newDPI / 96.0);
+	Log(L"WM_DPICHANGED, current scale: %f, new scale: %f\n", DrawingDims.drawScale, newDPI / 96.0);
 	return 1;
 }
 
@@ -2430,7 +2558,7 @@ static i64 OnSwitcherPaint(void)
 	if (BeginPaint(Switcher, &ps)) {
 		if (ps.fErase) {
 		}
-		BitBlt(ps.hdc, 0, 0, DrawingRect.right - DrawingRect.left, DrawingRect.bottom - DrawingRect.top, DrawingContext, 0, 0, SRCCOPY);
+		BitBlt(ps.hdc, 0, 0, DrawingDims.drawRect.right - DrawingDims.drawRect.left, DrawingDims.drawRect.bottom - DrawingDims.drawRect.top, DrawingContext, 0, 0, SRCCOPY);
 		EndPaint(Switcher, &ps);
 	}
 	return 1;
@@ -2467,39 +2595,47 @@ static i64 OnSwitcherMouseMove(i32 x, i32 y)
 		return 0;
 	}
 
-	struct app *mouseoverApp = GetAppForPosition(MouseX, MouseY);
+	struct app *newMouseApp = GetAppForPosition(MouseX, MouseY);
 
-	if (SelectedApp != mouseoverApp && mouseoverApp) {
-		if (IsWindowVisible(WindowBar)) { // Previews belong to the previously selected app, so back out of window switching
-			HideWindowBar();
-			Mode = MODE_APPS;
-		}
-		SelectedApp = mouseoverApp;
-		SelectedWindow = &SelectedApp->windows[0];
-		/*dbg*/Log(L"select app ");
-		/*dbg*/LogWindow(*SelectedWindow);
+	if (MouseApp != newMouseApp) {
+		MouseApp = newMouseApp;
+		/*dbg*/Log(L"mouseover app ");
+		/*dbg*/LogWindow(MouseApp ? MouseApp->windows[0] : NULL);
 		RedrawSwitcher();
 	}
-
-	if (mouseoverApp) {
-		SetCursor(LoadCursor(null, IDC_HAND));
+	if (MouseApp) {
+		SetCursor(LoadCursorW(NULL, IDC_HAND));
 	} else {
-		SetCursor(LoadCursor(null, IDC_ARROW));
+		SetCursor(LoadCursorW(NULL, IDC_ARROW));
 	}
 
 	return 1;
 }
 
-static i64 OnSwitcherMouseLeave(void)
+static i64 OnSwitcherMouseDown(void)
 {
-	OnSwitcherMouseMove(0, 0);
+	MouseDown = true;
+	RedrawSwitcher();
+	if (MouseApp) {
+		SetCursor(LoadCursorW(NULL, IDC_HAND));
+	} else {
+		SetCursor(LoadCursorW(NULL, IDC_ARROW));
+	}
 	return 1;
 }
 
 static i64 OnSwitcherMouseUp(void)
 {
-	ShowSelectedWindow();
-	HideSwitcher();
+	MouseDown = false;
+	if (MouseApp) {
+		SelectedApp = MouseApp;
+		SelectedWindow = &SelectedApp->windows[0];
+		/*dbg*/Log(L"select app ");
+		/*dbg*/LogWindow(*SelectedWindow);
+		ShowSelectedWindow();
+		HideSwitcher();
+	}
+	SetCursor(LoadCursorW(NULL, IDC_ARROW));
 	return 1;
 }
 
@@ -2533,9 +2669,17 @@ static LRESULT CALLBACK SwitcherWindowProcedure(HWND hwnd, UINT message, WPARAM 
 			TrackMouseEvent(&(TRACKMOUSEEVENT){.cbSize = sizeof(TRACKMOUSEEVENT), .dwFlags = TME_LEAVE, .hwndTrack = hwnd});
 			return OnSwitcherMouseMove(LOWORD(lparam), HIWORD(lparam));
 		case WM_MOUSELEAVE:
-			return OnSwitcherMouseLeave();
+			return OnSwitcherMouseMove(0, 0);
+		case WM_LBUTTONDOWN:
+			SetCapture(hwnd);
+			return OnSwitcherMouseDown();
 		case WM_LBUTTONUP:
+			// The order should reversed, but can't be bothered to store ret value and break every case
+			ReleaseCapture();
 			return OnSwitcherMouseUp();
+		case WM_CAPTURECHANGED:
+			if ((HWND)lparam != hwnd) {}
+			return 1;
 		case WM_CLOSE:
 			return OnSwitcherClose();
 		case WM_DESTROY:

@@ -1254,7 +1254,7 @@ static void AddToHistory(handle hwnd) {
 	if (HistoryCount < countof(History)) {
 		HistoryCount++;
 	}
-	memmove(&History[1], &History[0], sizeof History[0] * HistoryCount);
+	memmove(&History[1], &History[0], sizeof History[0] * (HistoryCount - 1)); // When full, the oldest hwnd falls off the end
 	History[0] = hwnd;
 	Log(L"activate window %s", GetAppHost(hwnd) != hwnd ? L"(uwp) " : L"");
 	LogWindow(hwnd);
